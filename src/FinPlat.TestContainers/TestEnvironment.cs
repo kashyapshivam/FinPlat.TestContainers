@@ -286,6 +286,40 @@ public class TableAccessor
 }
 
 /// <summary>
+/// Represents a captured HTTP request recorded by WireMock.
+/// Includes method, URL, body, and headers for deep assertion.
+/// </summary>
+public class CapturedRequest
+{
+    /// <summary>HTTP method (GET, POST, PUT, etc.).</summary>
+    public string Method { get; set; } = string.Empty;
+
+    /// <summary>Full URL path including query string.</summary>
+    public string Url { get; set; } = string.Empty;
+
+    /// <summary>Raw request body as a string.</summary>
+    public string Body { get; set; } = string.Empty;
+
+    /// <summary>Request headers (name → first value).</summary>
+    public Dictionary<string, string> Headers { get; set; } = new();
+
+    /// <summary>Shortcut for Content-Type header.</summary>
+    public string? ContentType => Headers.GetValueOrDefault("Content-Type");
+
+    /// <summary>Shortcut for Authorization header.</summary>
+    public string? Authorization => Headers.GetValueOrDefault("Authorization");
+
+    /// <summary>Shortcut for correlation ID header (checks common casing variants).</summary>
+    public string? CorrelationId =>
+        Headers.GetValueOrDefault("x-correlation-id") ??
+        Headers.GetValueOrDefault("X-Correlation-Id") ??
+        Headers.GetValueOrDefault("X-CorrelationId");
+
+    /// <summary>Parses the body as a JSON document for assertion.</summary>
+    public System.Text.Json.JsonDocument BodyAsJson() => System.Text.Json.JsonDocument.Parse(Body);
+}
+
+/// <summary>
 /// Provides assertion and verification methods for a WireMock mock API.
 /// </summary>
 public class MockApiAccessor
@@ -334,5 +368,42 @@ public class MockApiAccessor
     public async Task<int> GetCallCountAsync(string path)
     {
         return await _container.GetCallCountAsync(path);
+    }
+
+    /// <summary>
+    /// Gets all captured requests that matched the specified path.
+    /// Returns full request details including method, URL, body, and headers.
+    /// </summary>
+    /// <param name="path">The URL path to find requests for.</param>
+    /// <returns>Array of captured requests.</returns>
+    public async Task<CapturedRequest[]> GetRequestsAsync(string path)
+    {
+        return await _container.GetRequestsAsync(path);
+    }
+
+    /// <summary>
+    /// Gets just the request bodies for all requests matching the specified path.
+    /// Convenience method for quick payload assertions.
+    /// </summary>
+    /// <param name="path">The URL path to find requests for.</param>
+    /// <returns>Array of request body strings.</returns>
+    public async Task<string[]> GetRequestBodiesAsync(string path)
+    {
+        var requests = await _container.GetRequestsAsync(path);
+        var bodies = new List<string>();
+        foreach (var req in requests)
+        {
+            bodies.Add(req.Body);
+        }
+        return bodies.ToArray();
+    }
+
+    /// <summary>
+    /// Clears the WireMock request journal so subsequent queries only see new requests.
+    /// Call this in [TestInitialize] to isolate request assertions between tests.
+    /// </summary>
+    public async Task ResetRequestLogAsync()
+    {
+        await _container.ResetRequestLogAsync();
     }
 }

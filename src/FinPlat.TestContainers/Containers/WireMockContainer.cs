@@ -119,6 +119,73 @@ public class ManagedWireMockContainer : IAsyncDisposable
         return doc.RootElement.GetProperty("count").GetInt32();
     }
 
+    /// <summary>
+    /// Gets all captured requests that matched the specified path.
+    /// Returns full request details including method, URL, body, and headers.
+    /// </summary>
+    /// <param name="path">The URL path to find requests for.</param>
+    /// <returns>Array of captured requests with body and headers.</returns>
+    public async Task<CapturedRequest[]> GetRequestsAsync(string path)
+    {
+        var requestBody = JsonSerializer.Serialize(new { urlPathPattern = $".*{EscapeRegex(path)}.*" });
+        var content = new StringContent(requestBody, Encoding.UTF8, "application/json");
+        var response = await _httpClient.PostAsync($"{Url}/__admin/requests/find", content);
+        response.EnsureSuccessStatusCode();
+
+        var responseJson = await response.Content.ReadAsStringAsync();
+        using var doc = JsonDocument.Parse(responseJson);
+
+        var requests = doc.RootElement.GetProperty("requests");
+        var result = new System.Collections.Generic.List<CapturedRequest>();
+
+        foreach (var req in requests.EnumerateArray())
+        {
+            var captured = new CapturedRequest
+            {
+                Method = req.TryGetProperty("method", out var m) ? m.GetString() ?? "" : "",
+                Url = req.TryGetProperty("url", out var u) ? u.GetString() ?? "" : "",
+                Body = req.TryGetProperty("body", out var b) ? b.GetString() ?? "" : ""
+            };
+
+            if (req.TryGetProperty("headers", out var headers))
+            {
+                foreach (var header in headers.EnumerateObject())
+                {
+                    // WireMock returns headers as { "Name": { "values": ["v1"] } } or as strings
+                    if (header.Value.ValueKind == JsonValueKind.Object &&
+                        header.Value.TryGetProperty("values", out var vals) &&
+                        vals.GetArrayLength() > 0)
+                    {
+                        captured.Headers[header.Name] = vals[0].GetString() ?? "";
+                    }
+                    else if (header.Value.ValueKind == JsonValueKind.String)
+                    {
+                        captured.Headers[header.Name] = header.Value.GetString() ?? "";
+                    }
+                }
+            }
+
+            result.Add(captured);
+        }
+
+        return result.ToArray();
+    }
+
+    /// <summary>
+    /// Clears the WireMock request journal so subsequent queries only see new requests.
+    /// Call this between tests to isolate request assertions.
+    /// </summary>
+    public async Task ResetRequestLogAsync()
+    {
+        var response = await _httpClient.DeleteAsync($"{Url}/__admin/requests");
+        response.EnsureSuccessStatusCode();
+    }
+
+    private static string EscapeRegex(string input)
+    {
+        return System.Text.RegularExpressions.Regex.Escape(input);
+    }
+
     /// <inheritdoc />
     public async ValueTask DisposeAsync()
     {
