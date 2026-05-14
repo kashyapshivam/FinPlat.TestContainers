@@ -3,6 +3,7 @@ using System.Collections.Generic;
 using System.Threading.Tasks;
 using Azure.Data.Tables;
 using Azure.Storage.Blobs;
+using Azure.Storage.Blobs.Models;
 using Azure.Storage.Queues;
 using FinPlat.TestContainers.Config;
 using FinPlat.TestContainers.Containers;
@@ -98,6 +99,31 @@ public class TestEnvironment : IAsyncDisposable
             throw new InvalidOperationException($"Application '{name}' was not registered.");
 
         return container;
+    }
+
+    /// <summary>
+    /// Gets a <see cref="StorageAccessor"/> for accessing Azure Storage resources in Azurite
+    /// without pre-declaring specific containers/queues/tables.
+    /// Useful for verifying data written by application containers.
+    /// </summary>
+    public StorageAccessor Storage()
+    {
+        if (_azurite is null)
+            throw new InvalidOperationException("Azurite was not added to the test environment.");
+
+        return new StorageAccessor(_azurite.ConnectionString);
+    }
+
+    /// <summary>
+    /// Gets container logs for the specified application. Useful for debugging failures.
+    /// </summary>
+    /// <param name="appName">Name of the application.</param>
+    public async Task<string> GetLogsAsync(string appName)
+    {
+        if (!_appContainers.TryGetValue(appName, out var container))
+            throw new InvalidOperationException($"Application '{appName}' was not registered.");
+
+        return await container.GetLogsAsync();
     }
 
     /// <inheritdoc />
@@ -225,6 +251,32 @@ public class BlobAccessor
         var blobClient = _client.GetBlobClient(blobName);
         var response = await blobClient.ExistsAsync();
         return response.Value;
+    }
+
+    /// <summary>
+    /// Lists all blobs in the container, optionally filtered by prefix.
+    /// Useful for verifying that an application wrote expected data to storage.
+    /// </summary>
+    /// <param name="prefix">Optional prefix to filter blobs.</param>
+    /// <returns>List of blob names.</returns>
+    public async Task<List<string>> ListBlobsAsync(string? prefix = null)
+    {
+        var names = new List<string>();
+        await foreach (var item in _client.GetBlobsAsync(BlobTraits.None, BlobStates.None, prefix, System.Threading.CancellationToken.None))
+        {
+            names.Add(item.Name);
+        }
+        return names;
+    }
+
+    /// <summary>
+    /// Gets the number of blobs in the container, optionally filtered by prefix.
+    /// </summary>
+    /// <param name="prefix">Optional prefix to filter blobs.</param>
+    public async Task<int> GetBlobCountAsync(string? prefix = null)
+    {
+        var blobs = await ListBlobsAsync(prefix);
+        return blobs.Count;
     }
 }
 
@@ -405,5 +457,71 @@ public class MockApiAccessor
     public async Task ResetRequestLogAsync()
     {
         await _container.ResetRequestLogAsync();
+    }
+}
+
+/// <summary>
+/// Provides generic access to Azure Storage services in Azurite.
+/// Unlike <see cref="BlobAccessor"/>, <see cref="QueueAccessor"/>, and <see cref="TableAccessor"/>
+/// which require pre-declared resources, this accessor can access any container/queue/table
+/// created by application containers at runtime.
+/// </summary>
+public class StorageAccessor
+{
+    private readonly string _connectionString;
+
+    internal StorageAccessor(string connectionString)
+    {
+        _connectionString = connectionString;
+    }
+
+    /// <summary>
+    /// Gets a <see cref="BlobAccessor"/> for the specified container.
+    /// The container does not need to be pre-declared via wiring.
+    /// </summary>
+    public BlobAccessor Blobs(string containerName)
+        => new(_connectionString, containerName);
+
+    /// <summary>
+    /// Gets a <see cref="QueueAccessor"/> for the specified queue.
+    /// The queue does not need to be pre-declared via wiring.
+    /// </summary>
+    public QueueAccessor Queues(string queueName)
+        => new(_connectionString, queueName);
+
+    /// <summary>
+    /// Gets a <see cref="TableAccessor"/> for the specified table.
+    /// The table does not need to be pre-declared via wiring.
+    /// </summary>
+    public TableAccessor Tables(string tableName)
+        => new(_connectionString, tableName);
+
+    /// <summary>
+    /// Lists all blob containers in the storage account.
+    /// Useful for discovering containers created by application containers.
+    /// </summary>
+    public async Task<List<string>> ListContainersAsync()
+    {
+        var serviceClient = new BlobServiceClient(_connectionString);
+        var names = new List<string>();
+        await foreach (var container in serviceClient.GetBlobContainersAsync())
+        {
+            names.Add(container.Name);
+        }
+        return names;
+    }
+
+    /// <summary>
+    /// Lists all queues in the storage account.
+    /// </summary>
+    public async Task<List<string>> ListQueuesAsync()
+    {
+        var serviceClient = new QueueServiceClient(_connectionString);
+        var names = new List<string>();
+        await foreach (var queue in serviceClient.GetQueuesAsync())
+        {
+            names.Add(queue.Name);
+        }
+        return names;
     }
 }

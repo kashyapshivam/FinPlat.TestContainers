@@ -34,4 +34,21 @@ public class WiringConfig
     /// instead of connection strings for storage access.
     /// </summary>
     public bool UseTokenAuth { get; set; }
+
+    /// <summary>
+    /// When true, inject an Azurite connection string even when token auth mode is enabled globally.
+    /// Used for apps that need simple connection-string access (e.g., Collector in Development mode).
+    /// </summary>
+    public bool InjectConnectionString { get; set; }
+
+    /// <summary>
+    /// Custom env var name for the connection string. Defaults to "ConnectionStrings__AzureStorage".
+    /// </summary>
+    public string? ConnectionStringEnvVar { get; set; }
+
+    /// <summary>
+    /// Maps application names to environment variable keys for app-to-app URL injection.
+    /// E.g., ("collector-fd", "CollectorUri") → injects http://collector-fd:8080/ as CollectorUri.
+    /// </summary>
+    public Dictionary<string, (string EnvVar, int? Port, string Scheme)> AppUrlBindings { get; } = new();
 }

@@ -19,16 +19,21 @@ public static class ConfigInjector
     /// Dictionary mapping mock API names to their internal URLs on the Docker network.
     /// </param>
     /// <param name="azuriteOptions">Optional Azurite options for token auth mode.</param>
+    /// <param name="appInternalUrls">
+    /// Dictionary mapping application names to their resolved internal URLs.
+    /// Used for app-to-app URL injection via <see cref="Builder.WiringBuilder.AppUrl"/>.
+    /// </param>
     /// <returns>A dictionary of environment variable name-value pairs.</returns>
     public static Dictionary<string, string> BuildEnvVars(
         WiringConfig wiring,
         string? azuriteInternalConnectionString,
         Dictionary<string, string> mockApiInternalUrls,
-        AzuriteOptions? azuriteOptions = null)
+        AzuriteOptions? azuriteOptions = null,
+        Dictionary<string, string>? appInternalUrls = null)
     {
         var envVars = new Dictionary<string, string>();
 
-        bool useTokenAuth = azuriteOptions?.UseTokenAuth == true;
+        bool useTokenAuth = wiring.UseTokenAuth && azuriteOptions?.UseTokenAuth == true;
 
         if (useTokenAuth)
         {
@@ -45,13 +50,15 @@ public static class ConfigInjector
             // Cert path for app to trust
             envVars["SLT_CERT_PATH"] = "/certs/ca-cert.pem";
         }
-        else
+
+        // Connection string injection — either simple mode default or explicit request
+        if (wiring.InjectConnectionString || (!useTokenAuth && azuriteInternalConnectionString is not null &&
+            (wiring.Queues.Count > 0 || wiring.BlobContainers.Count > 0 || wiring.Tables.Count > 0)))
         {
-            // Simple mode: inject connection string if Azurite is available
-            if (azuriteInternalConnectionString is not null &&
-                (wiring.Queues.Count > 0 || wiring.BlobContainers.Count > 0 || wiring.Tables.Count > 0))
+            var envVar = wiring.ConnectionStringEnvVar ?? "ConnectionStrings__AzureStorage";
+            if (azuriteInternalConnectionString is not null)
             {
-                envVars["ConnectionStrings__AzureStorage"] = azuriteInternalConnectionString;
+                envVars[envVar] = azuriteInternalConnectionString;
             }
         }
 
@@ -61,6 +68,18 @@ public static class ConfigInjector
             if (mockApiInternalUrls.TryGetValue(mockName, out var internalUrl))
             {
                 envVars[configKey] = internalUrl;
+            }
+        }
+
+        // Inject app-to-app URLs
+        if (appInternalUrls is not null)
+        {
+            foreach (var (targetAppName, (envVar, _, _)) in wiring.AppUrlBindings)
+            {
+                if (appInternalUrls.TryGetValue(targetAppName, out var url))
+                {
+                    envVars[envVar] = url;
+                }
             }
         }
 

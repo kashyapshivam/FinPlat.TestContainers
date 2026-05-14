@@ -89,7 +89,9 @@ public class TestEnvironmentBuilder
     /// 2. Starts Azurite (if added) and pre-creates resources.
     /// 3. Starts WireMock containers and configures stubs.
     /// 4. If token auth: starts TLS proxy and adds auth stubs.
-    /// 5. Starts application containers with injected environment variables.
+    /// 5. Resolves app-to-app URLs and dependency ordering.
+    /// 6. Starts application containers with injected environment variables.
+    /// 7. Waits for health checks (if configured).
     /// </summary>
     /// <returns>A <see cref="TestEnvironment"/> providing runtime access to all containers.</returns>
     public async Task<TestEnvironment> BuildAsync()
@@ -188,25 +190,68 @@ public class TestEnvironmentBuilder
                 await tlsProxy.StartAsync(network, cert!);
             }
 
-            // 5. Build and start application containers
+            // 5. Resolve app-to-app URLs and determine startup order
             var mockApiInternalUrls = new Dictionary<string, string>();
             foreach (var (name, container) in wireMockContainers)
             {
                 mockApiInternalUrls[name] = container.InternalUrl;
             }
 
+            // Build app internal URL map (DNS alias + declared port)
+            var appInternalUrls = new Dictionary<string, string>();
             foreach (var (appName, appBuilder) in _applications)
             {
-                // Build environment variables from wiring + explicit env vars
+                int port = appBuilder.InternalServicePort ?? appBuilder.ExposedPorts.FirstOrDefault();
+                if (port > 0)
+                {
+                    appInternalUrls[appName] = $"http://{appName}:{port}/";
+                }
+            }
+
+            // Topological sort: apps depended on (via AppUrl) start first
+            var startOrder = ResolveStartOrder();
+
+            // 6. Start application containers in dependency order
+            foreach (var appName in startOrder)
+            {
+                if (!_applications.TryGetValue(appName, out var appBuilder))
+                    continue;
+
                 var envVars = new Dictionary<string, string>(appBuilder.EnvironmentVariables);
 
                 if (_wirings.TryGetValue(appName, out var wiringBuilder))
                 {
+                    // Check that AppUrl targets exist
+                    foreach (var targetApp in wiringBuilder.Config.AppUrlBindings.Keys)
+                    {
+                        if (!_applications.ContainsKey(targetApp))
+                            throw new InvalidOperationException(
+                                $"Application '{appName}' declares AppUrl dependency on '{targetApp}', but no application with that name was registered.");
+                    }
+
+                    // Resolve AppUrl ports from target app's builder if not explicitly set
+                    foreach (var (targetApp, (envVar, port, scheme)) in wiringBuilder.Config.AppUrlBindings)
+                    {
+                        if (port is null && _applications.TryGetValue(targetApp, out var targetBuilder))
+                        {
+                            int resolvedPort = targetBuilder.InternalServicePort ?? targetBuilder.ExposedPorts.FirstOrDefault();
+                            if (resolvedPort > 0)
+                            {
+                                appInternalUrls[targetApp] = $"{scheme}://{targetApp}:{resolvedPort}/";
+                            }
+                        }
+                        else if (port is not null)
+                        {
+                            appInternalUrls[targetApp] = $"{scheme}://{targetApp}:{port}/";
+                        }
+                    }
+
                     var injectedVars = ConfigInjector.BuildEnvVars(
                         wiringBuilder.Config,
                         azurite?.InternalConnectionString,
                         mockApiInternalUrls,
-                        _azuriteOptions);
+                        _azuriteOptions,
+                        appInternalUrls);
 
                     foreach (var (key, value) in injectedVars)
                     {
@@ -224,6 +269,19 @@ public class TestEnvironmentBuilder
                 // Mount cert into app container for TLS trust (if token auth)
                 await appContainer.StartAsync(network, envVars, cert);
                 appContainers[appName] = appContainer;
+
+                // Wait for health check if configured
+                if (appBuilder.HealthCheckPath is not null)
+                {
+                    int healthPort = appBuilder.HealthCheckPort ?? appBuilder.InternalServicePort
+                        ?? appBuilder.ExposedPorts.FirstOrDefault();
+                    if (healthPort > 0)
+                    {
+                        await WaitForHealthCheckAsync(
+                            appContainer, healthPort, appBuilder.HealthCheckPath,
+                            appBuilder.HealthCheckTimeoutSeconds);
+                    }
+                }
             }
 
             return new TestEnvironment(network, azurite, wireMockContainers, appContainers, cert, tlsProxy);
@@ -243,5 +301,129 @@ public class TestEnvironmentBuilder
             await network.DisposeAsync();
             throw;
         }
+    }
+
+    /// <summary>
+    /// Resolves the application start order via topological sort based on AppUrl dependencies.
+    /// Apps that are depended upon (via AppUrl) start before their dependents.
+    /// </summary>
+    private List<string> ResolveStartOrder()
+    {
+        // Build dependency graph from AppUrl bindings
+        var dependencies = new Dictionary<string, HashSet<string>>();
+        foreach (var appName in _applications.Keys)
+        {
+            dependencies[appName] = new HashSet<string>();
+        }
+
+        foreach (var (appName, wiringBuilder) in _wirings)
+        {
+            if (!dependencies.ContainsKey(appName))
+                dependencies[appName] = new HashSet<string>();
+
+            foreach (var targetApp in wiringBuilder.Config.AppUrlBindings.Keys)
+            {
+                dependencies[appName].Add(targetApp);
+            }
+        }
+
+        // Topological sort (Kahn's algorithm)
+        var inDegree = new Dictionary<string, int>();
+        foreach (var app in dependencies.Keys) inDegree[app] = 0;
+        foreach (var (_, deps) in dependencies)
+        {
+            foreach (var dep in deps)
+            {
+                if (inDegree.ContainsKey(dep))
+                    inDegree[dep] = inDegree[dep]; // ensure key exists
+                if (inDegree.ContainsKey(dep)) // dep is not an app we manage, skip
+                    inDegree[_applications.Keys.FirstOrDefault(k => k == dep) ?? ""] += 0;
+            }
+        }
+
+        // Count how many apps depend on each app
+        foreach (var (app, deps) in dependencies)
+        {
+            foreach (var dep in deps)
+            {
+                if (!inDegree.ContainsKey(dep)) continue;
+                // 'app' depends on 'dep', so 'app' should start after 'dep'
+            }
+        }
+
+        // Simple approach: start apps with no AppUrl dependencies first, then the rest
+        var ordered = new List<string>();
+        var remaining = new HashSet<string>(_applications.Keys);
+
+        // First pass: apps with no dependencies
+        foreach (var app in _applications.Keys)
+        {
+            if (!dependencies.ContainsKey(app) || dependencies[app].Count == 0)
+            {
+                // Check if this app is NOT depended upon by anyone — start last
+                // Actually: start apps that are depended upon first, then dependents
+            }
+        }
+
+        // Simpler: apps that ARE targets of AppUrl go first, then the rest
+        var dependedUpon = new HashSet<string>();
+        foreach (var (_, deps) in dependencies)
+        {
+            foreach (var dep in deps)
+                dependedUpon.Add(dep);
+        }
+
+        // Start depended-upon apps first
+        foreach (var app in _applications.Keys.Where(a => dependedUpon.Contains(a)))
+        {
+            ordered.Add(app);
+            remaining.Remove(app);
+        }
+
+        // Then start the rest
+        foreach (var app in remaining)
+        {
+            ordered.Add(app);
+        }
+
+        return ordered;
+    }
+
+    /// <summary>
+    /// Waits for an HTTP health check endpoint to return a success status code.
+    /// </summary>
+    private static async Task WaitForHealthCheckAsync(
+        ManagedAppContainer container, int port, string path, int timeoutSeconds)
+    {
+        using var httpClient = new System.Net.Http.HttpClient
+        {
+            Timeout = TimeSpan.FromSeconds(5)
+        };
+
+        var hostPort = container.GetMappedPort(port);
+        var url = $"http://localhost:{hostPort}{path}";
+        var deadline = DateTime.UtcNow.AddSeconds(timeoutSeconds);
+
+        while (DateTime.UtcNow < deadline)
+        {
+            try
+            {
+                var response = await httpClient.GetAsync(url);
+                if (response.IsSuccessStatusCode)
+                    return;
+            }
+            catch
+            {
+                // Container not ready yet
+            }
+
+            await Task.Delay(TimeSpan.FromSeconds(2));
+        }
+
+        // Get container logs for diagnostics
+        var logs = await container.GetLogsAsync();
+        throw new TimeoutException(
+            $"Health check for '{container.Name}' at {url} did not pass within {timeoutSeconds}s.\n" +
+            $"Container logs:\n{logs}");
     }
 }

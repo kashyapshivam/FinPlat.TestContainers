@@ -110,6 +110,11 @@ public class ManagedAppContainer : IAsyncDisposable
     }
 
     /// <summary>
+    /// The name of this application container (also used as Docker network alias).
+    /// </summary>
+    public string Name => _name;
+
+    /// <summary>
     /// Retrieves the stdout/stderr logs from the application container.
     /// </summary>
     /// <returns>The container logs as a string.</returns>
@@ -120,6 +125,19 @@ public class ManagedAppContainer : IAsyncDisposable
 
         var (stdout, stderr) = await _container.GetLogsAsync();
         return $"{stdout}\n{stderr}";
+    }
+
+    /// <summary>
+    /// Gets the host-mapped port for a given container port.
+    /// </summary>
+    /// <param name="containerPort">The internal container port.</param>
+    /// <returns>The mapped host port.</returns>
+    public ushort GetMappedPort(int containerPort)
+    {
+        if (_container is null)
+            throw new InvalidOperationException($"Container '{_name}' has not been started.");
+
+        return _container.GetMappedPublicPort(containerPort);
     }
 
     /// <inheritdoc />

@@ -14,6 +14,10 @@ public class ApplicationBuilder
     internal string? ImageName { get; private set; }
     internal Dictionary<string, string> EnvironmentVariables { get; } = new();
     internal List<int> ExposedPorts { get; } = new();
+    internal int? InternalServicePort { get; private set; }
+    internal string? HealthCheckPath { get; private set; }
+    internal int? HealthCheckPort { get; private set; }
+    internal int HealthCheckTimeoutSeconds { get; private set; } = 60;
 
     /// <summary>
     /// Builds the application container from a Dockerfile.
@@ -57,6 +61,34 @@ public class ApplicationBuilder
     public ApplicationBuilder WithPort(int containerPort)
     {
         ExposedPorts.Add(containerPort);
+        return this;
+    }
+
+    /// <summary>
+    /// Declares the internal service port for app-to-app communication.
+    /// Used by <see cref="WiringBuilder.AppUrl"/> to construct the internal URL.
+    /// </summary>
+    /// <param name="port">The port the application listens on inside the container.</param>
+    public ApplicationBuilder WithInternalPort(int port)
+    {
+        InternalServicePort = port;
+        if (!ExposedPorts.Contains(port))
+            ExposedPorts.Add(port);
+        return this;
+    }
+
+    /// <summary>
+    /// Declares an HTTP health check endpoint. The builder will wait for a 200 response
+    /// from this endpoint before considering the application ready.
+    /// </summary>
+    /// <param name="path">Health check URL path (e.g., "/v1/ping").</param>
+    /// <param name="port">Port to check. Defaults to <see cref="InternalServicePort"/>.</param>
+    /// <param name="timeoutSeconds">Maximum time to wait for readiness. Default is 60 seconds.</param>
+    public ApplicationBuilder WithHttpHealthCheck(string path, int? port = null, int timeoutSeconds = 60)
+    {
+        HealthCheckPath = path;
+        HealthCheckPort = port;
+        HealthCheckTimeoutSeconds = timeoutSeconds;
         return this;
     }
 }

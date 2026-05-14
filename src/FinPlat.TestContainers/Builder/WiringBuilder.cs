@@ -67,4 +67,33 @@ public class WiringBuilder
         Config.UseTokenAuth = true;
         return this;
     }
+
+    /// <summary>
+    /// Injects an Azurite connection string into the application container.
+    /// Use this for apps that need simple connection-string access even when
+    /// the global Azurite is in token auth mode.
+    /// </summary>
+    /// <param name="envVarName">
+    /// Environment variable name. Defaults to "ConnectionStrings__AzureStorage".
+    /// </param>
+    public WiringBuilder StorageConnectionString(string envVarName = "ConnectionStrings__AzureStorage")
+    {
+        Config.InjectConnectionString = true;
+        Config.ConnectionStringEnvVar = envVarName;
+        return this;
+    }
+
+    /// <summary>
+    /// Injects another application's internal URL as an environment variable.
+    /// Creates an implicit startup dependency: this app waits for the target app's readiness.
+    /// </summary>
+    /// <param name="targetAppName">Name of the target application (must match AddApplication name).</param>
+    /// <param name="asEnvVar">Environment variable name to inject the URL into.</param>
+    /// <param name="port">Internal port of the target application. Defaults to the app's declared port.</param>
+    /// <param name="scheme">URL scheme. Defaults to "http".</param>
+    public WiringBuilder AppUrl(string targetAppName, string asEnvVar, int? port = null, string scheme = "http")
+    {
+        Config.AppUrlBindings[targetAppName] = (asEnvVar, port, scheme);
+        return this;
+    }
 }
