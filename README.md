@@ -10,6 +10,12 @@ A .NET library for Docker-based Service Level Testing (SLT). Spins up real servi
 - **Mixed Auth Modes** — Per-app token auth or connection string auth against shared Azurite
 - **Storage Accessors** — Read/write queues, blobs, and tables from test code
 - **Fluent Builder API** — Declarative test environment configuration
+- **Fixture Engine** — Typed fixture builders, registry, JSON templates with variable substitution
+- **Parallel Execution** — Resource isolation with Docker labels, unique naming, orphan cleanup
+- **Log Assertions** — Container log verification (literal, regex, structured JSON, error detection)
+- **CI Intelligence** — Git-diff-based test selection with file-to-test mapping
+- **Test Dashboards** — TRX parser with markdown/JSON report generation
+- **Scaffolding** — Generate Dockerfile, config, and test class boilerplate for new services
 
 ## Quick Start
 
@@ -137,6 +143,124 @@ The builder automatically:
 |--------|-------------|
 | `ListBlobsAsync()` | List all blobs in the container |
 | `GetBlobCountAsync()` | Count blobs in the container |
+
+## Fixture Engine
+
+Create typed, deterministic test fixtures with the builder pattern:
+
+```csharp
+// Fluent builder
+var order = new FixtureBuilder<OrderEvent>()
+    .With(o => o.OrderId = "ORD-12345")
+    .With(o => o.Status = "Closed")
+    .Build();
+
+// Serialize for queue messages
+string json = new FixtureBuilder<OrderEvent>()
+    .With(o => o.OrderId = "test-001")
+    .BuildBase64Json();
+
+// Registry for reusable templates
+var registry = new FixtureRegistry();
+registry.Register("closed-order", () => new OrderEvent { Status = "Closed" });
+var fixture = registry.Create<OrderEvent>("closed-order");
+
+// JSON template files with variable substitution
+var message = FixtureFile.LoadBase64("Scenarios/order.json",
+    new Dictionary<string, string> { ["orderId"] = "ORD-999" });
+```
+
+## Parallel Execution
+
+Run tests in parallel without Docker resource collisions:
+
+```csharp
+var env = await new TestEnvironmentBuilder()
+    .WithInstanceId()  // auto-generates unique prefix
+    .AddAzurite()
+    .AddApplication("my-service", app => { /* ... */ })
+    .BuildAsync();
+```
+
+Clean up orphaned resources from failed test runs:
+
+```csharp
+var result = await CleanupEngine.CleanupOrphanedAsync(TimeSpan.FromHours(1));
+Console.WriteLine($"Removed {result.TotalRemoved} orphaned resources");
+```
+
+## Log Assertions
+
+Verify container log output with fluent assertions:
+
+```csharp
+var logAssert = await env.AssertLogsAsync("my-service");
+logAssert
+    .ContainsLine("Application started")
+    .DoesNotContain("FATAL")
+    .HasNoErrors()
+    .HasSequence("Initializing", "Ready", "Processing")
+    .Verify();
+
+// Polling — wait for a log line to appear
+await env.WaitForLogLineAsync("my-service", "Processing complete", TimeSpan.FromSeconds(30));
+
+// Structured JSON log analysis
+var entries = logAssert.ParseStructuredLogs();
+logAssert.HasNoStructuredLogsAtOrAbove(LogSeverity.Error).Verify();
+```
+
+## CI Intelligence
+
+Select tests based on git changes:
+
+```csharp
+var result = await new TestSelector()
+    .WithRepoRoot(".")
+    .WithBaseBranch("origin/main")
+    .MapDirectory("src/Workers/BigCat", "BigCatProductSltTests")
+    .MapDirectory("src/Workers/Asset", "AssetSltTests")
+    .MapFiles("*.csproj", "BigCatProductSltTests", "AssetSltTests")  // config change → run all
+    .SelectAsync();
+
+Console.WriteLine($"Changed: {result.ChangedFiles.Count} files");
+Console.WriteLine($"Running: {string.Join(", ", result.SelectedTests)}");
+Console.WriteLine($"Filter: dotnet test --filter \"{result.ToDotnetTestFilter()}\"");
+```
+
+## Test Dashboards
+
+Parse TRX results and generate reports:
+
+```csharp
+var report = TestResultParser.ParseTrx("TestResults/results.trx");
+Console.WriteLine(report.ToMarkdownSummary());  // Markdown table with pass rate, failures, slowest tests
+File.WriteAllText("report.json", report.ToJsonSummary());
+
+// Merge multiple TRX files
+var merged = TestResultParser.ParseMultipleTrx(
+    TestResultParser.FindTrxFiles("TestResults/"));
+```
+
+## Scaffolding
+
+Generate SLT boilerplate for a new service:
+
+```csharp
+await SltScaffolder.GenerateAsync(new ScaffoldOptions
+{
+    ServiceName = "order-service",
+    OutputDirectory = ".slt",
+    TestProjectDirectory = "tests/OrderService.SltTests",
+    QueueNames = { "order-queue-v1" },
+    MockApis = { "CatalogUri", "BillingUri" },
+    ServicePort = 8080,
+    HealthCheckPath = "/health",
+});
+// Generates: .slt/docker/Dockerfile.slt, config.docker.json,
+//            tests/OrderService.SltTests/OrderServiceSltTests.cs,
+//            .slt/Scenarios/OrderService/happy-path.json
+```
 
 ## Requirements
 
