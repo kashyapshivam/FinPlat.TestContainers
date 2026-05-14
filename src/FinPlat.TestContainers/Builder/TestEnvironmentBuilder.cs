@@ -6,6 +6,7 @@ using DotNet.Testcontainers.Builders;
 using DotNet.Testcontainers.Networks;
 using FinPlat.TestContainers.Config;
 using FinPlat.TestContainers.Containers;
+using FinPlat.TestContainers.Isolation;
 
 namespace FinPlat.TestContainers.Builder;
 
@@ -20,6 +21,24 @@ public class TestEnvironmentBuilder
     private readonly Dictionary<string, ApplicationBuilder> _applications = new();
     private readonly Dictionary<string, MockApiBuilder> _mockApis = new();
     private readonly Dictionary<string, WiringBuilder> _wirings = new();
+    private string? _instanceId;
+
+    /// <summary>
+    /// Sets the instance ID for resource isolation in parallel test execution.
+    /// If not called, an auto-generated ID is used. All Docker resources (network,
+    /// containers) will be prefixed with this ID and labeled for cleanup.
+    /// </summary>
+    /// <param name="instanceId">
+    /// Custom instance ID, or null to auto-generate. Keep it short (8 chars max).
+    /// </param>
+    public TestEnvironmentBuilder WithInstanceId(string? instanceId = null)
+    {
+        _instanceId = instanceId ?? ResourceIsolation.GenerateInstanceId();
+        return this;
+    }
+
+    /// <summary>Gets the instance ID (auto-generated if not explicitly set).</summary>
+    internal string InstanceId => _instanceId ??= ResourceIsolation.GenerateInstanceId();
 
     /// <summary>
     /// Adds an Azurite container in simple mode (HTTP, connection string).
