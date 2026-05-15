@@ -50,4 +50,12 @@ public class AzuriteOptions
     /// Default: "00000000-0000-0000-0000-000000000000"
     /// </summary>
     public string ClientId { get; set; } = "00000000-0000-0000-0000-000000000000";
+
+    /// <summary>
+    /// External certificate material to use instead of generating a new one.
+    /// Set this when your Docker image already has a specific cert in its trust store
+    /// (e.g., baked in during build). The library will use this cert for Azurite HTTPS
+    /// and the TLS proxy instead of generating a new self-signed cert.
+    /// </summary>
+    public CertificateMaterial? ExternalCertificate { get; set; }
 }

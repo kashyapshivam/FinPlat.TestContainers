@@ -1,6 +1,5 @@
 using System;
 using System.Collections.Generic;
-using System.IO;
 using System.Text;
 using System.Threading.Tasks;
 using DotNet.Testcontainers.Builders;
@@ -38,6 +37,7 @@ internal class ManagedTlsProxyContainer : IAsyncDisposable
         yield return $"{account}.blob.{suffix}";
         yield return $"{account}.queue.{suffix}";
         yield return $"{account}.table.{suffix}";
+        yield return $"{account}.dfs.{suffix}";
 
         foreach (var host in _options.AuthorityHosts)
         {
@@ -50,12 +50,7 @@ internal class ManagedTlsProxyContainer : IAsyncDisposable
     /// </summary>
     internal async Task StartAsync(INetwork network, CertificateMaterial cert)
     {
-        var (certPath, keyPath) = cert.WriteTempFiles();
         var nginxConf = GenerateNginxConfig();
-
-        // Write nginx config to temp file
-        var confPath = Path.Combine(Path.GetDirectoryName(certPath)!, "nginx.conf");
-        await File.WriteAllTextAsync(confPath, nginxConf);
 
         var aliases = new List<string>(GetNetworkAliases());
 
@@ -63,9 +58,9 @@ internal class ManagedTlsProxyContainer : IAsyncDisposable
             .WithImage("nginx:alpine")
             .WithNetwork(network)
             .WithNetworkAliases(aliases.ToArray())
-            .WithResourceMapping(certPath, "/etc/nginx/certs/cert.pem")
-            .WithResourceMapping(keyPath, "/etc/nginx/certs/key.pem")
-            .WithResourceMapping(confPath, "/etc/nginx/nginx.conf")
+            .WithResourceMapping(Encoding.UTF8.GetBytes(cert.CertPem), "/etc/nginx/certs/cert.pem")
+            .WithResourceMapping(Encoding.UTF8.GetBytes(cert.KeyPem), "/etc/nginx/certs/key.pem")
+            .WithResourceMapping(Encoding.UTF8.GetBytes(nginxConf), "/etc/nginx/nginx.conf")
             .WithWaitStrategy(Wait.ForUnixContainer().UntilPortIsAvailable(443));
 
         _container = builder.Build();
@@ -82,15 +77,24 @@ internal class ManagedTlsProxyContainer : IAsyncDisposable
         }
     }
 
+    internal async Task<string> GetLogsAsync()
+    {
+        if (_container is null) return string.Empty;
+        var (stdout, stderr) = await _container.GetLogsAsync();
+        return $"{stdout}\n{stderr}";
+    }
+
     private string GenerateNginxConfig()
     {
         var suffix = _options.EndpointSuffix;
         var sb = new StringBuilder();
 
         sb.AppendLine("worker_processes 1;");
+        sb.AppendLine("error_log /dev/stderr info;");
         sb.AppendLine("events { worker_connections 128; }");
         sb.AppendLine();
         sb.AppendLine("http {");
+        sb.AppendLine("    access_log /dev/stderr;");
 
         // Auth endpoint(s) - route to WireMock
         foreach (var host in _options.AuthorityHosts)
@@ -120,9 +124,47 @@ internal class ManagedTlsProxyContainer : IAsyncDisposable
         // Table service - route to Azurite port 10002
         AppendStorageServer(sb, "table", 10002);
 
+        // DFS (Data Lake) service - Azurite doesn't support DFS APIs,
+        // so we return mock success responses directly from nginx.
+        AppendDfsMockServer(sb);
+
         sb.AppendLine("}");
 
         return sb.ToString();
+    }
+
+    private void AppendDfsMockServer(StringBuilder sb)
+    {
+        var suffix = _options.EndpointSuffix;
+
+        sb.AppendLine($"    server {{");
+        sb.AppendLine($"        listen 443 ssl;");
+        sb.AppendLine($"        server_name ~^(?<account>.+)\\.dfs\\.{EscapeForRegex(suffix)}$;");
+        sb.AppendLine();
+        sb.AppendLine($"        ssl_certificate /etc/nginx/certs/cert.pem;");
+        sb.AppendLine($"        ssl_certificate_key /etc/nginx/certs/key.pem;");
+        sb.AppendLine($"        client_max_body_size 256m;");
+        sb.AppendLine();
+        // DFS CreatePath (PUT ?resource=file) → 201 Created
+        sb.AppendLine($"        location / {{");
+        sb.AppendLine($"            if ($request_method = PUT) {{");
+        sb.AppendLine($"                return 201;");
+        sb.AppendLine($"            }}");
+        // DFS Append (PATCH ?action=append) → 202, Flush (PATCH ?action=flush) → 200
+        sb.AppendLine($"            if ($arg_action = append) {{");
+        sb.AppendLine($"                return 202;");
+        sb.AppendLine($"            }}");
+        sb.AppendLine($"            if ($arg_action = flush) {{");
+        sb.AppendLine($"                return 200;");
+        sb.AppendLine($"            }}");
+        // DFS GetProperties (HEAD) → 200 OK
+        sb.AppendLine($"            if ($request_method = HEAD) {{");
+        sb.AppendLine($"                return 200;");
+        sb.AppendLine($"            }}");
+        sb.AppendLine($"            return 200;");
+        sb.AppendLine($"        }}");
+        sb.AppendLine($"    }}");
+        sb.AppendLine();
     }
 
     private void AppendStorageServer(StringBuilder sb, string service, int port)
@@ -137,9 +179,11 @@ internal class ManagedTlsProxyContainer : IAsyncDisposable
         sb.AppendLine($"        ssl_certificate_key /etc/nginx/certs/key.pem;");
         sb.AppendLine();
         sb.AppendLine($"        location / {{");
+        sb.AppendLine($"            rewrite ^/(.*)$ /$account/$1 break;");
         sb.AppendLine($"            proxy_pass https://azurite:{port};");
         sb.AppendLine($"            proxy_ssl_verify off;");
-        sb.AppendLine($"            proxy_set_header Host $host;");
+        sb.AppendLine($"            proxy_set_header Host 127.0.0.1;");
+        sb.AppendLine($"            proxy_set_header Authorization $http_authorization;");
         sb.AppendLine($"            proxy_set_header X-Forwarded-Proto https;");
 
         if (service == "blob")

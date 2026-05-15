@@ -131,10 +131,11 @@ public class TestEnvironmentBuilder
 
         try
         {
-            // Generate certificate if token auth mode
+            // Generate certificate if token auth mode (or use externally provided cert)
             if (useTokenAuth)
             {
-                cert = CertificateGenerator.Generate(_azuriteOptions!);
+                cert = _azuriteOptions!.ExternalCertificate
+                    ?? CertificateGenerator.Generate(_azuriteOptions!);
             }
 
             // 2. Start Azurite if configured

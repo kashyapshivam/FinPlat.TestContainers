@@ -1,5 +1,6 @@
 using System;
 using System.Collections.Generic;
+using System.Text;
 using System.Threading.Tasks;
 using DotNet.Testcontainers.Builders;
 using DotNet.Testcontainers.Containers;
@@ -95,8 +96,8 @@ public class ManagedAppContainer : IAsyncDisposable
         // Mount certificate for TLS trust if provided
         if (cert is not null)
         {
-            var (certPath, _) = cert.WriteTempFiles();
-            builder = builder.WithResourceMapping(certPath, "/certs/ca-cert.pem");
+            builder = builder.WithResourceMapping(
+                Encoding.UTF8.GetBytes(cert.CertPem), "/certs/ca-cert.pem");
         }
 
         if (_exposedPorts.Count > 0)

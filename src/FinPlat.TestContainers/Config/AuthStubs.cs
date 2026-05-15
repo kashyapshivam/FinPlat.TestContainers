@@ -10,7 +10,7 @@ namespace FinPlat.TestContainers.Config;
 public static class AuthStubs
 {
     private const string FakeAccessToken =
-        "eyJhbGciOiJSUzI1NiIsInR5cCI6IkpXVCJ9.eyJhdWQiOiJodHRwczovL3N0b3JhZ2UuYXp1cmUuY29tIiwiaXNzIjoiaHR0cHM6Ly9zdHMud2luZG93cy5uZXQvMDAwMDAwMDAtMDAwMC0wMDAwLTAwMDAtMDAwMDAwMDAwMDAwLyIsImlhdCI6MTcwMDAwMDAwMCwiZXhwIjo5OTk5OTk5OTk5LCJzdWIiOiJ0ZXN0LXN1YmplY3QifQ.fake-signature";
+        "eyJhbGciOiJSUzI1NiIsInR5cCI6IkpXVCJ9.eyJhdWQiOiJodHRwczovL3N0b3JhZ2UuYXp1cmUuY29tIiwiaXNzIjoiaHR0cHM6Ly9zdHMud2luZG93cy5uZXQvMDAwMDAwMDAtMDAwMC0wMDAwLTAwMDAtMDAwMDAwMDAwMDAwLyIsImlhdCI6MTcwMDAwMDAwMCwibmJmIjoxNzAwMDAwMDAwLCJleHAiOjk5OTk5OTk5OTksInN1YiI6InRlc3Qtc3ViamVjdCJ9.fake-signature";
 
     /// <summary>
     /// Creates a stub for the OAuth2 token endpoint (POST /{tenant}/oauth2/v2.0/token).

@@ -10,3 +10,4 @@ C:\Users\shivkashyap\repos\FinPlat.TestContainers\src\FinPlat.TestContainers\obj
 C:\Users\shivkashyap\repos\FinPlat.TestContainers\src\FinPlat.TestContainers\obj\Debug\net8.0\refint\FinPlat.TestContainers.dll
 C:\Users\shivkashyap\repos\FinPlat.TestContainers\src\FinPlat.TestContainers\obj\Debug\net8.0\FinPlat.TestContainers.pdb
 C:\Users\shivkashyap\repos\FinPlat.TestContainers\src\FinPlat.TestContainers\obj\Debug\net8.0\ref\FinPlat.TestContainers.dll
+C:\Users\shivkashyap\repos\FinPlat.TestContainers\src\FinPlat.TestContainers\obj\Debug\net8.0\FinPlat.TestContainers.sourcelink.json

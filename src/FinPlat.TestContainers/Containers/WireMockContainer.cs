@@ -20,11 +20,17 @@ public class StubDefinition
     /// <summary>URL path to match.</summary>
     public string Path { get; set; } = "/";
 
+    /// <summary>When true, Path is treated as a regex pattern (urlPathPattern).</summary>
+    public bool IsPathPattern { get; set; }
+
     /// <summary>HTTP status code to return.</summary>
     public int StatusCode { get; set; } = 200;
 
     /// <summary>Response body to return.</summary>
     public string ResponseBody { get; set; } = "{}";
+
+    /// <summary>Priority for stub matching (lower = higher priority). Default is 0 (highest).</summary>
+    public int? Priority { get; set; }
 }
 
 /// <summary>
@@ -200,7 +206,13 @@ public class ManagedWireMockContainer : IAsyncDisposable
     private static string BuildMappingJson(StubDefinition stub)
     {
         object request;
-        if (stub.Method == "ANY")
+        if (stub.IsPathPattern)
+        {
+            request = stub.Method == "ANY"
+                ? (object)new { urlPathPattern = stub.Path }
+                : new { method = stub.Method, urlPathPattern = stub.Path };
+        }
+        else if (stub.Method == "ANY")
         {
             request = new { urlPath = stub.Path };
         }
@@ -209,20 +221,25 @@ public class ManagedWireMockContainer : IAsyncDisposable
             request = new { method = stub.Method, urlPath = stub.Path };
         }
 
-        var mapping = new
+        var response = new
         {
-            request,
-            response = new
-            {
-                status = stub.StatusCode,
-                body = stub.ResponseBody,
-                headers = new { Content_Type = "application/json" }
-            }
+            status = stub.StatusCode,
+            body = stub.ResponseBody,
+            headers = new { Content_Type = "application/json" }
         };
 
-        return JsonSerializer.Serialize(mapping, new JsonSerializerOptions
+        string json;
+        if (stub.Priority.HasValue)
         {
-            PropertyNamingPolicy = JsonNamingPolicy.CamelCase
-        });
+            var mapping = new { priority = stub.Priority.Value, request, response };
+            json = JsonSerializer.Serialize(mapping, new JsonSerializerOptions { PropertyNamingPolicy = JsonNamingPolicy.CamelCase });
+        }
+        else
+        {
+            var mapping = new { request, response };
+            json = JsonSerializer.Serialize(mapping, new JsonSerializerOptions { PropertyNamingPolicy = JsonNamingPolicy.CamelCase });
+        }
+
+        return json;
     }
 }

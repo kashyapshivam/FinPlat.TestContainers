@@ -63,4 +63,24 @@ public class MockApiBuilder
         });
         return this;
     }
+
+    /// <summary>
+    /// Registers a low-priority catch-all stub that matches any request not handled by other stubs.
+    /// Useful for returning default responses to unknown service endpoints.
+    /// </summary>
+    /// <param name="statusCode">HTTP response status code.</param>
+    /// <param name="body">Response body as a string.</param>
+    public MockApiBuilder OnUnmatched(int statusCode = 200, string body = "{}")
+    {
+        Stubs.Add(new StubDefinition
+        {
+            Method = "ANY",
+            Path = ".*",
+            IsPathPattern = true,
+            StatusCode = statusCode,
+            ResponseBody = body,
+            Priority = 99
+        });
+        return this;
+    }
 }

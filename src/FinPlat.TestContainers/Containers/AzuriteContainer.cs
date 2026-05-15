@@ -1,5 +1,7 @@
 using System;
 using System.Collections.Generic;
+using System.Net.Http;
+using System.Text;
 using System.Threading.Tasks;
 using Azure.Data.Tables;
 using Azure.Storage.Blobs;
@@ -87,7 +89,9 @@ public class ManagedAzuriteContainer : IAsyncDisposable
     /// </summary>
     public async Task CreateQueueAsync(string queueName)
     {
-        var client = new QueueClient(ConnectionString, queueName);
+        var options = new QueueClientOptions();
+        ConfigureSslBypass(options);
+        var client = new QueueClient(ConnectionString, queueName, options);
         await client.CreateIfNotExistsAsync();
     }
 
@@ -96,7 +100,9 @@ public class ManagedAzuriteContainer : IAsyncDisposable
     /// </summary>
     public async Task CreateBlobContainerAsync(string containerName)
     {
-        var client = new BlobContainerClient(ConnectionString, containerName);
+        var options = new BlobClientOptions();
+        ConfigureSslBypass(options);
+        var client = new BlobContainerClient(ConnectionString, containerName, options);
         await client.CreateIfNotExistsAsync();
     }
 
@@ -105,8 +111,22 @@ public class ManagedAzuriteContainer : IAsyncDisposable
     /// </summary>
     public async Task CreateTableAsync(string tableName)
     {
-        var serviceClient = new TableServiceClient(ConnectionString);
+        var options = new TableClientOptions();
+        ConfigureSslBypass(options);
+        var serviceClient = new TableServiceClient(ConnectionString, options);
         await serviceClient.CreateTableIfNotExistsAsync(tableName);
+    }
+
+    private void ConfigureSslBypass(Azure.Core.ClientOptions options)
+    {
+        if (_httpsContainer is not null)
+        {
+            var handler = new HttpClientHandler
+            {
+                ServerCertificateCustomValidationCallback = HttpClientHandler.DangerousAcceptAnyServerCertificateValidator
+            };
+            options.Transport = new Azure.Core.Pipeline.HttpClientTransport(handler);
+        }
     }
 
     /// <inheritdoc />
@@ -125,6 +145,38 @@ public class ManagedAzuriteContainer : IAsyncDisposable
         }
     }
 
+    /// <summary>
+    /// Gets the Azurite container logs for debugging.
+    /// </summary>
+    public async Task<string> GetLogsAsync()
+    {
+        if (_httpsContainer is not null)
+        {
+            var (stdout, stderr) = await _httpsContainer.GetLogsAsync();
+            // Also try to get debug log
+            string debugLog = "";
+            try
+            {
+                var result = await _httpsContainer.ExecAsync(new[] { "head", "-c", "4000", "/tmp/azurite_debug.log" });
+                debugLog = $"\n=== AZURITE DEBUG LOG (head) ===\n{result.Stdout}";
+            }
+            catch { /* debug log may not exist */ }
+            try
+            {
+                var result2 = await _httpsContainer.ExecAsync(new[] { "tail", "-c", "3000", "/tmp/azurite_debug.log" });
+                debugLog += $"\n=== AZURITE DEBUG LOG (tail) ===\n{result2.Stdout}";
+            }
+            catch { /* debug log may not exist */ }
+            return $"{stdout}\n{stderr}{debugLog}";
+        }
+        if (_simpleContainer is not null)
+        {
+            var (stdout, stderr) = await _simpleContainer.GetLogsAsync();
+            return $"{stdout}\n{stderr}";
+        }
+        return string.Empty;
+    }
+
     private async Task StartSimpleAsync(INetwork network)
     {
         _simpleContainer = new AzuriteBuilderType()
@@ -140,8 +192,6 @@ public class ManagedAzuriteContainer : IAsyncDisposable
 
     private async Task StartHttpsAsync(INetwork network, CertificateMaterial cert)
     {
-        var (certPath, keyPath) = cert.WriteTempFiles();
-
         var command = new List<string>
         {
             "azurite",
@@ -151,7 +201,8 @@ public class ManagedAzuriteContainer : IAsyncDisposable
             "--cert", "/certs/cert.pem",
             "--key", "/certs/key.pem",
             "--oauth", "basic",
-            "--loose"
+            "--loose",
+            "--debug", "/tmp/azurite_debug.log"
         };
 
         if (_options!.SkipApiVersionCheck)
@@ -167,8 +218,8 @@ public class ManagedAzuriteContainer : IAsyncDisposable
             .WithPortBinding(BlobPort, true)
             .WithPortBinding(QueuePort, true)
             .WithPortBinding(TablePort, true)
-            .WithResourceMapping(certPath, "/certs/cert.pem")
-            .WithResourceMapping(keyPath, "/certs/key.pem")
+            .WithResourceMapping(Encoding.UTF8.GetBytes(cert.CertPem), "/certs/cert.pem")
+            .WithResourceMapping(Encoding.UTF8.GetBytes(cert.KeyPem), "/certs/key.pem")
             .WithWaitStrategy(Wait.ForUnixContainer().UntilPortIsAvailable(QueuePort))
             .Build();
 

@@ -1,5 +1,6 @@
 using System;
 using System.Collections.Generic;
+using System.Net.Http;
 using System.Threading.Tasks;
 using Azure.Data.Tables;
 using Azure.Storage.Blobs;
@@ -50,7 +51,7 @@ public class TestEnvironment : IAsyncDisposable
         if (_azurite is null)
             throw new InvalidOperationException("Azurite was not added to the test environment.");
 
-        return new QueueAccessor(_azurite.ConnectionString, queueName);
+        return new QueueAccessor(_azurite.ConnectionString, queueName, _cert is not null);
     }
 
     /// <summary>
@@ -62,7 +63,7 @@ public class TestEnvironment : IAsyncDisposable
         if (_azurite is null)
             throw new InvalidOperationException("Azurite was not added to the test environment.");
 
-        return new BlobAccessor(_azurite.ConnectionString, containerName);
+        return new BlobAccessor(_azurite.ConnectionString, containerName, _cert is not null);
     }
 
     /// <summary>
@@ -74,7 +75,7 @@ public class TestEnvironment : IAsyncDisposable
         if (_azurite is null)
             throw new InvalidOperationException("Azurite was not added to the test environment.");
 
-        return new TableAccessor(_azurite.ConnectionString, tableName);
+        return new TableAccessor(_azurite.ConnectionString, tableName, _cert is not null);
     }
 
     /// <summary>
@@ -126,6 +127,24 @@ public class TestEnvironment : IAsyncDisposable
         return await container.GetLogsAsync();
     }
 
+    /// <summary>
+    /// Retrieves the TLS proxy (nginx) container logs for debugging.
+    /// </summary>
+    public async Task<string> GetProxyLogsAsync()
+    {
+        if (_tlsProxy is null) return string.Empty;
+        return await _tlsProxy.GetLogsAsync();
+    }
+
+    /// <summary>
+    /// Retrieves the Azurite container logs for debugging.
+    /// </summary>
+    public async Task<string> GetAzuriteLogsAsync()
+    {
+        if (_azurite is null) return string.Empty;
+        return await _azurite.GetLogsAsync();
+    }
+
     /// <inheritdoc />
     public async ValueTask DisposeAsync()
     {
@@ -168,9 +187,11 @@ public class QueueAccessor
 {
     private readonly QueueClient _client;
 
-    internal QueueAccessor(string connectionString, string queueName)
+    internal QueueAccessor(string connectionString, string queueName, bool bypassSsl = false)
     {
-        _client = new QueueClient(connectionString, queueName);
+        var options = new QueueClientOptions();
+        if (bypassSsl) SslHelper.ConfigureSslBypass(options);
+        _client = new QueueClient(connectionString, queueName, options);
     }
 
     /// <summary>Sends a text message to the queue.</summary>
@@ -218,9 +239,11 @@ public class BlobAccessor
 {
     private readonly BlobContainerClient _client;
 
-    internal BlobAccessor(string connectionString, string containerName)
+    internal BlobAccessor(string connectionString, string containerName, bool bypassSsl = false)
     {
-        _client = new BlobContainerClient(connectionString, containerName);
+        var options = new BlobClientOptions();
+        if (bypassSsl) SslHelper.ConfigureSslBypass(options);
+        _client = new BlobContainerClient(connectionString, containerName, options);
     }
 
     /// <summary>Uploads a string as a blob.</summary>
@@ -287,9 +310,11 @@ public class TableAccessor
 {
     private readonly TableClient _client;
 
-    internal TableAccessor(string connectionString, string tableName)
+    internal TableAccessor(string connectionString, string tableName, bool bypassSsl = false)
     {
-        _client = new TableClient(connectionString, tableName);
+        var options = new TableClientOptions();
+        if (bypassSsl) SslHelper.ConfigureSslBypass(options);
+        _client = new TableClient(connectionString, tableName, options);
     }
 
     /// <summary>
@@ -369,6 +394,18 @@ public class CapturedRequest
 
     /// <summary>Parses the body as a JSON document for assertion.</summary>
     public System.Text.Json.JsonDocument BodyAsJson() => System.Text.Json.JsonDocument.Parse(Body);
+}
+
+file static class SslHelper
+{
+    internal static void ConfigureSslBypass(Azure.Core.ClientOptions options)
+    {
+        var handler = new HttpClientHandler
+        {
+            ServerCertificateCustomValidationCallback = HttpClientHandler.DangerousAcceptAnyServerCertificateValidator
+        };
+        options.Transport = new Azure.Core.Pipeline.HttpClientTransport(handler);
+    }
 }
 
 /// <summary>

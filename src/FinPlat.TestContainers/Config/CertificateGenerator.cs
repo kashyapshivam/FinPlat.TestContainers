@@ -68,7 +68,7 @@ public class CertificateMaterial : IDisposable
     /// <summary>PEM-encoded RSA private key.</summary>
     public string KeyPem { get; }
 
-    internal CertificateMaterial(string certPem, string keyPem)
+    public CertificateMaterial(string certPem, string keyPem)
     {
         CertPem = certPem;
         KeyPem = keyPem;

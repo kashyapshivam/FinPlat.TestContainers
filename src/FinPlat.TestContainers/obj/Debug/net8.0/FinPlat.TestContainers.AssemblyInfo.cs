@@ -13,7 +13,7 @@ using System.Reflection;
 [assembly: System.Reflection.AssemblyCompanyAttribute("FinPlat.TestContainers")]
 [assembly: System.Reflection.AssemblyConfigurationAttribute("Debug")]
 [assembly: System.Reflection.AssemblyFileVersionAttribute("1.0.0.0")]
-[assembly: System.Reflection.AssemblyInformationalVersionAttribute("1.0.0")]
+[assembly: System.Reflection.AssemblyInformationalVersionAttribute("1.0.0+488a241f0e83bbec1e3557353be541e72466a53f")]
 [assembly: System.Reflection.AssemblyProductAttribute("FinPlat.TestContainers")]
 [assembly: System.Reflection.AssemblyTitleAttribute("FinPlat.TestContainers")]
 [assembly: System.Reflection.AssemblyVersionAttribute("1.0.0.0")]
