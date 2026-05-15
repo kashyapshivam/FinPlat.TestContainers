@@ -1,13 +1,15 @@
 using System.Security.Cryptography;
 using System.Security.Cryptography.X509Certificates;
 using System.Text;
+using System.Text.Json;
 using FinPlat.Slt.Cli.Models;
 
 namespace FinPlat.Slt.Cli.Generation;
 
 /// <summary>
-/// Generates all SLT infrastructure files from an SltManifest.
-/// Handles Dockerfile, config, nginx, certs, and test class generation.
+/// Generates SLT files purely from manifest values.
+/// Zero service-specific or collector-specific knowledge.
+/// Every decision is driven by slt.json fields.
 /// </summary>
 public static class SltGenerator
 {
@@ -16,47 +18,46 @@ public static class SltGenerator
         var result = new GenerationResult();
         var sltDir = Path.Combine(repoRoot, ".slt");
 
-        // 1. Generate manifest
+        // 1. Save manifest
         var manifestPath = Path.Combine(sltDir, "slt.json");
         manifest.SaveToFile(manifestPath);
         result.Generated.Add(manifestPath);
 
-        // 2. Generate Dockerfile
+        // 2. Docker infrastructure
+        var dockerDir = Path.Combine(sltDir, "docker");
+        Directory.CreateDirectory(dockerDir);
+
         if (manifest.Docker.Dockerfile == null)
         {
-            var dockerDir = Path.Combine(sltDir, "docker");
-            Directory.CreateDirectory(dockerDir);
-
-            var dockerfilePath = Path.Combine(dockerDir, "Dockerfile.slt");
-            await WriteIfAllowedAsync(dockerfilePath, GenerateDockerfile(manifest, repoRoot), options, result);
+            await WriteIfAllowedAsync(
+                Path.Combine(dockerDir, "Dockerfile.slt"),
+                GenerateDockerfile(manifest), options, result);
         }
 
-        // 3. Generate config.docker.json
-        var configPath = Path.Combine(sltDir, "docker", "config.docker.json");
-        await WriteIfAllowedAsync(configPath, GenerateDockerConfig(manifest), options, result);
+        await WriteIfAllowedAsync(
+            Path.Combine(dockerDir, "config.docker.json"),
+            GenerateDockerConfig(manifest), options, result);
 
-        // 4. Generate nginx + certs (if HTTPS proxy needed)
+        // 3. Nginx proxy (if needed)
         if (manifest.Infrastructure.UseHttpsProxy)
         {
-            var nginxDir = Path.Combine(sltDir, "docker", "nginx");
+            var nginxDir = Path.Combine(dockerDir, "nginx");
             Directory.CreateDirectory(nginxDir);
 
-            await WriteIfAllowedAsync(
-                Path.Combine(nginxDir, "nginx.conf"),
-                GenerateNginxConfig(), options, result);
-
-            // Generate self-signed certificate
-            await GenerateCertificateAsync(nginxDir, result);
+            await WriteIfAllowedAsync(Path.Combine(nginxDir, "nginx.conf"),
+                GenerateNginxConfig(manifest), options, result);
+            await WriteIfAllowedAsync(Path.Combine(nginxDir, "Dockerfile"),
+                GenerateNginxDockerfile(), options, result);
+            await GenerateCertificateAsync(nginxDir, manifest, result);
         }
 
-        // 5. Generate .gitignore for .slt
-        var gitignorePath = Path.Combine(sltDir, ".gitignore");
-        if (!File.Exists(gitignorePath))
-        {
-            await WriteIfAllowedAsync(gitignorePath, GenerateGitignore(), options, result);
-        }
+        // 4. Publish script + gitignore
+        await WriteIfAllowedAsync(Path.Combine(sltDir, "publish.ps1"),
+            GeneratePublishScript(manifest), options, result);
+        await WriteIfAllowedAsync(Path.Combine(sltDir, ".gitignore"),
+            GenerateGitignore(), options, result);
 
-        // 6. Generate test project and classes
+        // 5. Test project
         if (manifest.Tests.ProjectPath != null)
         {
             var testProjDir = Path.Combine(repoRoot, Path.GetDirectoryName(manifest.Tests.ProjectPath)!);
@@ -64,178 +65,231 @@ public static class SltGenerator
 
             var csprojPath = Path.Combine(repoRoot, manifest.Tests.ProjectPath);
             if (!File.Exists(csprojPath))
-            {
-                await WriteIfAllowedAsync(csprojPath, GenerateTestCsproj(manifest), options, result);
-            }
+                await WriteIfAllowedAsync(csprojPath, GenerateTestCsproj(manifest, repoRoot), options, result);
 
-            // Generate test class for each worker
             var scenarioDir = Path.Combine(testProjDir, "Scenarios");
             Directory.CreateDirectory(scenarioDir);
 
             foreach (var worker in manifest.Workers)
             {
-                var className = ToPascalCase(worker.Name.Replace("QueueWorkerV1", "").Replace("Worker", ""));
-                var testPath = Path.Combine(testProjDir, $"{className}SltTests.cs");
-                await WriteIfAllowedAsync(testPath,
+                var className = DeriveClassName(worker.Name);
+                await WriteIfAllowedAsync(
+                    Path.Combine(testProjDir, $"{className}SltTests.cs"),
                     GenerateTestClass(manifest, worker, className), options, result);
 
-                // Generate scenario directory
                 var workerScenarioDir = Path.Combine(scenarioDir, className);
                 Directory.CreateDirectory(workerScenarioDir);
-
                 var scenarioPath = Path.Combine(workerScenarioDir, "happy-path.json");
                 if (!File.Exists(scenarioPath))
-                {
-                    await WriteIfAllowedAsync(scenarioPath, GenerateScenarioFile(), options, result);
-                }
+                    await WriteIfAllowedAsync(scenarioPath, GenerateScenarioFile(worker), options, result);
             }
         }
 
         return result;
     }
 
-    private static string GenerateDockerfile(SltManifest manifest, string repoRoot)
-    {
-        var publishProject = manifest.Docker.PublishProject ?? manifest.ServiceProject;
-        var sb = new StringBuilder();
+    #region Dockerfile — driven by manifest.Docker.*
 
-        sb.AppendLine("# Auto-generated by dotnet-slt. Edit .slt/slt.json to customize.");
-        sb.AppendLine("FROM mcr.microsoft.com/dotnet/sdk:8.0 AS build");
-        sb.AppendLine("WORKDIR /src");
+    private static string GenerateDockerfile(SltManifest manifest)
+    {
+        var entryDll = manifest.Docker.EntryDll
+            ?? Path.GetFileNameWithoutExtension(manifest.ServiceProject) + ".dll";
+        var certDest = manifest.Docker.CertInstall.CertDestination;
+        var certCmd = manifest.Docker.CertInstall.UpdateCommand;
+        var configTarget = manifest.Docker.ConfigTargetPath;
+
+        var sb = new StringBuilder();
+        sb.AppendLine($"# SLT Dockerfile — generated by dotnet-slt from .slt/slt.json");
+        sb.AppendLine($"# Usage: docker build -f .slt/docker/Dockerfile.slt -t {manifest.ServiceName.ToLowerInvariant()}-slt .slt/");
+        sb.AppendLine($"FROM {manifest.Docker.BaseImage}");
         sb.AppendLine();
-        sb.AppendLine("# Copy solution and restore");
-        sb.AppendLine("COPY . .");
-        sb.AppendLine($"RUN dotnet publish \"{publishProject}\" -c Release -o /app/publish --no-restore");
-        sb.AppendLine();
-        sb.AppendLine("FROM mcr.microsoft.com/dotnet/aspnet:8.0 AS runtime");
         sb.AppendLine("WORKDIR /app");
         sb.AppendLine();
-        sb.AppendLine("# Install CA certificate for Azurite HTTPS (token auth)");
-        sb.AppendLine("COPY .slt/docker/nginx/azurite.crt /usr/local/share/ca-certificates/azurite-ca.crt");
-        sb.AppendLine("RUN update-ca-certificates");
+        sb.AppendLine("# Install CA certificate for HTTPS proxy");
+        sb.AppendLine($"COPY docker/nginx/azurite.crt {certDest}");
+        sb.AppendLine($"RUN {certCmd}");
         sb.AppendLine();
-        sb.AppendLine("COPY --from=build /app/publish .");
+        sb.AppendLine("# Copy pre-published application");
+        sb.AppendLine("COPY publish/ .");
         sb.AppendLine();
-        sb.AppendLine("# Copy SLT config");
-        sb.AppendLine("COPY .slt/docker/config.docker.json /app/config.docker.json");
+        sb.AppendLine("# Inject SLT config");
+        sb.AppendLine($"COPY docker/config.docker.json {configTarget}");
         sb.AppendLine();
 
+        // Static env vars from manifest
         foreach (var (key, value) in manifest.Docker.EnvironmentVariables)
-        {
             sb.AppendLine($"ENV {key}={value}");
+
+        // Workload identity env vars (if enabled)
+        if (manifest.Docker.UseWorkloadIdentity)
+        {
+            sb.AppendLine("# Workload identity simulation");
+            sb.AppendLine("ENV AZURE_CLIENT_ID=00000000-0000-0000-0000-000000000000");
+            sb.AppendLine("ENV AZURE_TENANT_ID=00000000-0000-0000-0000-000000000000");
+            sb.AppendLine("ENV AZURE_CLIENT_SECRET=dummy-secret-for-slt");
+            sb.AppendLine("ENV AZURE_FEDERATED_TOKEN_FILE=/app/federated-token.txt");
+            sb.AppendLine("RUN echo \"dummy-federated-token\" > /app/federated-token.txt");
         }
 
-        sb.AppendLine($"EXPOSE {manifest.Docker.Port}");
         sb.AppendLine();
-        var dllName = Path.GetFileNameWithoutExtension(publishProject) + ".dll";
-        sb.AppendLine($"ENTRYPOINT [\"dotnet\", \"{dllName}\"]");
-
+        sb.AppendLine($"ENTRYPOINT [\"dotnet\", \"{entryDll}\"]");
         return sb.ToString();
     }
 
+    #endregion
+
+    #region Docker config — driven by manifest.Workers + ExternalApis + Infrastructure
+
     private static string GenerateDockerConfig(SltManifest manifest)
     {
-        var sb = new StringBuilder();
-        sb.AppendLine("{");
-        sb.AppendLine("  \"Environment\": \"docker\",");
+        var config = new Dictionary<string, object>();
 
-        // Queue worker configuration
+        // Workers
         if (manifest.Workers.Count > 0)
         {
-            sb.AppendLine("  \"AzureQueueWorkerConfiguration\": [");
-            for (int i = 0; i < manifest.Workers.Count; i++)
-            {
-                var w = manifest.Workers[i];
-                var comma = i < manifest.Workers.Count - 1 ? "," : "";
-                sb.AppendLine("    {");
-                sb.AppendLine($"      \"Name\": \"{w.Name}\",");
-                sb.AppendLine("      \"DeadLetterWorkerInstances\": 0,");
-                sb.AppendLine("      \"TestDeadLetterWorkerInstances\": 0,");
-                sb.AppendLine("      \"TestWorkerInstances\": 0,");
-                sb.AppendLine("      \"WorkerInstances\": 1");
-                sb.AppendLine($"    }}{comma}");
-            }
-            sb.AppendLine("  ],");
+            config["AzureQueueWorkerConfiguration"] = manifest.Workers
+                .Select(w => new Dictionary<string, object>
+                {
+                    ["Name"] = w.Name,
+                    ["DeadLetterWorkerInstances"] = 0,
+                    ["TestDeadLetterWorkerInstances"] = 0,
+                    ["TestWorkerInstances"] = 0,
+                    ["WorkerInstances"] = 1
+                }).ToList();
         }
 
-        // External API URIs (point to WireMock)
+        // API URIs — each points to WireMock
         foreach (var api in manifest.ExternalApis)
         {
-            sb.AppendLine($"  \"{api.ConfigKey}\": \"http://mock-services:8080{api.BasePath}\",");
+            config[api.ConfigKey] = $"http://mock-services:8080{api.BasePath}";
         }
 
-        // Storage configuration
-        sb.AppendLine("  \"StorageAccountConfiguration\": [");
-        sb.AppendLine("    { \"Name\": \"devstoreaccount1\" }");
-        sb.AppendLine("  ],");
-        sb.AppendLine("  \"StorageAccountEndpointSuffix\": \"azurite.local\",");
+        // Storage
+        config["StorageAccountConfiguration"] = new[] { new { Name = "devstoreaccount1" } };
+        config["StorageAccountEndpointSuffix"] = "azurite.local";
 
-        // Table configuration
+        // Tables
         if (manifest.Infrastructure.Tables.Count > 0)
         {
-            var tableName = manifest.Infrastructure.Tables[0];
-            sb.AppendLine("  \"TableIndexAzureTableKeyValueStoreConfiguration\": [");
-            sb.AppendLine("    {");
-            sb.AppendLine("      \"AccountName\": \"devstoreaccount1\",");
-            sb.AppendLine("      \"EndpointSuffix\": \"azurite.local\",");
-            sb.AppendLine($"      \"TableName\": \"{tableName}\"");
-            sb.AppendLine("    }");
-            sb.AppendLine("  ],");
+            var tableEntry = new { AccountName = "devstoreaccount1", EndpointSuffix = "azurite.local", TableName = manifest.Infrastructure.Tables[0] };
+            config["TableIndexAzureTableKeyValueStoreConfiguration"] = new[] { tableEntry };
         }
 
-        sb.AppendLine("  \"UseWorkloadIdentity\": true,");
-        sb.AppendLine("  \"OpenTelemetryConsoleEnabled\": true,");
-        sb.AppendLine("  \"GenevaCounterProviderEnabled\": false,");
-        sb.AppendLine("  \"KeyVaultMonitorEnabled\": false");
+        // Telemetry off
+        config["OpenTelemetryConsoleEnabled"] = true;
+        config["GenevaCounterProviderEnabled"] = false;
+        config["KeyVaultMonitorEnabled"] = false;
+
+        if (manifest.Docker.UseWorkloadIdentity)
+            config["UseWorkloadIdentity"] = true;
+
+        // Merge extra config sections from manifest
+        if (manifest.Infrastructure.ExtraConfig != null)
+        {
+            foreach (var (key, value) in manifest.Infrastructure.ExtraConfig)
+                config[key] = value;
+        }
+
+        return JsonSerializer.Serialize(config, new JsonSerializerOptions { WriteIndented = true });
+    }
+
+    #endregion
+
+    #region Nginx — driven by manifest.Infrastructure.UseHttpsProxy + ProxyAuthEndpoint
+
+    private static string GenerateNginxConfig(SltManifest manifest)
+    {
+        var sb = new StringBuilder();
+        sb.AppendLine("# Auto-generated by dotnet-slt from .slt/slt.json");
+        sb.AppendLine("worker_processes 1;");
+        sb.AppendLine("events { worker_connections 128; }");
+        sb.AppendLine();
+        sb.AppendLine("http {");
+
+        // Auth endpoint proxy (optional)
+        if (manifest.Infrastructure.ProxyAuthEndpoint)
+        {
+            sb.AppendLine("    # Auth endpoint — intercepts login.microsoftonline.com");
+            sb.AppendLine("    server {");
+            sb.AppendLine("        listen 443 ssl;");
+            sb.AppendLine("        server_name login.microsoftonline.com;");
+            sb.AppendLine("        ssl_certificate /etc/nginx/certs/azurite.crt;");
+            sb.AppendLine("        ssl_certificate_key /etc/nginx/certs/azurite.key;");
+            sb.AppendLine("        location / {");
+            sb.AppendLine("            proxy_pass http://wiremock:8080;");
+            sb.AppendLine("            proxy_set_header Host $host;");
+            sb.AppendLine("            proxy_set_header X-Forwarded-Proto https;");
+            sb.AppendLine("        }");
+            sb.AppendLine("    }");
+            sb.AppendLine();
+        }
+
+        // Blob (10000)
+        sb.AppendLine("    # Blob service");
+        sb.AppendLine("    server {");
+        sb.AppendLine("        listen 443 ssl;");
+        sb.AppendLine("        server_name ~^(?<account>.+)\\.blob\\.azurite\\.local$;");
+        sb.AppendLine("        ssl_certificate /etc/nginx/certs/azurite.crt;");
+        sb.AppendLine("        ssl_certificate_key /etc/nginx/certs/azurite.key;");
+        sb.AppendLine("        location / {");
+        sb.AppendLine("            proxy_pass https://azurite:10000;");
+        sb.AppendLine("            proxy_ssl_verify off;");
+        sb.AppendLine("            proxy_set_header Host $host;");
+        sb.AppendLine("            client_max_body_size 256m;");
+        sb.AppendLine("            proxy_request_buffering off;");
+        sb.AppendLine("        }");
+        sb.AppendLine("    }");
+        sb.AppendLine();
+
+        // Queue (10001)
+        sb.AppendLine("    # Queue service");
+        sb.AppendLine("    server {");
+        sb.AppendLine("        listen 443 ssl;");
+        sb.AppendLine("        server_name ~^(?<account>.+)\\.queue\\.azurite\\.local$;");
+        sb.AppendLine("        ssl_certificate /etc/nginx/certs/azurite.crt;");
+        sb.AppendLine("        ssl_certificate_key /etc/nginx/certs/azurite.key;");
+        sb.AppendLine("        location / {");
+        sb.AppendLine("            proxy_pass https://azurite:10001;");
+        sb.AppendLine("            proxy_ssl_verify off;");
+        sb.AppendLine("            proxy_set_header Host $host;");
+        sb.AppendLine("        }");
+        sb.AppendLine("    }");
+        sb.AppendLine();
+
+        // Table (10002)
+        sb.AppendLine("    # Table service");
+        sb.AppendLine("    server {");
+        sb.AppendLine("        listen 443 ssl;");
+        sb.AppendLine("        server_name ~^(?<account>.+)\\.table\\.azurite\\.local$;");
+        sb.AppendLine("        ssl_certificate /etc/nginx/certs/azurite.crt;");
+        sb.AppendLine("        ssl_certificate_key /etc/nginx/certs/azurite.key;");
+        sb.AppendLine("        location / {");
+        sb.AppendLine("            proxy_pass https://azurite:10002;");
+        sb.AppendLine("            proxy_ssl_verify off;");
+        sb.AppendLine("            proxy_set_header Host $host;");
+        sb.AppendLine("        }");
+        sb.AppendLine("    }");
         sb.AppendLine("}");
 
         return sb.ToString();
     }
 
-    private static string GenerateNginxConfig()
+    private static string GenerateNginxDockerfile()
     {
         return """
-            # Auto-generated by dotnet-slt
-            events { worker_connections 64; }
-            http {
-                upstream azurite_blob { server azurite:10000; }
-                upstream azurite_queue { server azurite:10001; }
-                upstream azurite_table { server azurite:10002; }
-
-                server {
-                    listen 443 ssl;
-                    server_name *.azurite.local azurite.local;
-                    ssl_certificate /etc/nginx/certs/azurite.crt;
-                    ssl_certificate_key /etc/nginx/certs/azurite.key;
-
-                    location / {
-                        # Route based on Azure Storage URL pattern
-                        proxy_pass http://azurite_blob;
-                        proxy_set_header Host $host;
-                        proxy_set_header X-Real-IP $remote_addr;
-                    }
-                }
-
-                server {
-                    listen 10001 ssl;
-                    server_name *.azurite.local;
-                    ssl_certificate /etc/nginx/certs/azurite.crt;
-                    ssl_certificate_key /etc/nginx/certs/azurite.key;
-                    location / { proxy_pass http://azurite_queue; proxy_set_header Host $host; }
-                }
-
-                server {
-                    listen 10002 ssl;
-                    server_name *.azurite.local;
-                    ssl_certificate /etc/nginx/certs/azurite.crt;
-                    ssl_certificate_key /etc/nginx/certs/azurite.key;
-                    location / { proxy_pass http://azurite_table; proxy_set_header Host $host; }
-                }
-            }
+            FROM nginx:alpine
+            RUN mkdir -p /etc/nginx/certs
+            COPY nginx.conf /etc/nginx/nginx.conf
+            COPY azurite.crt /etc/nginx/certs/azurite.crt
+            COPY azurite.key /etc/nginx/certs/azurite.key
             """;
     }
 
-    private static async Task GenerateCertificateAsync(string nginxDir, GenerationResult result)
+    #endregion
+
+    #region Certificates
+
+    private static async Task GenerateCertificateAsync(string nginxDir, SltManifest manifest, GenerationResult result)
     {
         var certPath = Path.Combine(nginxDir, "azurite.crt");
         var keyPath = Path.Combine(nginxDir, "azurite.key");
@@ -246,78 +300,90 @@ public static class SltGenerator
             return;
         }
 
-        // Generate self-signed certificate using .NET crypto
         using var rsa = RSA.Create(2048);
         var request = new CertificateRequest(
-            "CN=*.azurite.local, O=SLT Testing, C=US",
+            "CN=*.azurite.local, O=SLT, C=US",
             rsa, HashAlgorithmName.SHA256, RSASignaturePadding.Pkcs1);
 
-        // Add SAN extension
         var sanBuilder = new SubjectAlternativeNameBuilder();
         sanBuilder.AddDnsName("*.azurite.local");
+        sanBuilder.AddDnsName("*.blob.azurite.local");
+        sanBuilder.AddDnsName("*.queue.azurite.local");
+        sanBuilder.AddDnsName("*.table.azurite.local");
         sanBuilder.AddDnsName("azurite.local");
         sanBuilder.AddDnsName("localhost");
+        if (manifest.Infrastructure.ProxyAuthEndpoint)
+            sanBuilder.AddDnsName("login.microsoftonline.com");
+
         request.CertificateExtensions.Add(sanBuilder.Build());
-        request.CertificateExtensions.Add(
-            new X509BasicConstraintsExtension(true, false, 0, true));
+        request.CertificateExtensions.Add(new X509BasicConstraintsExtension(true, false, 0, true));
 
         using var cert = request.CreateSelfSigned(
-            DateTimeOffset.UtcNow.AddDays(-1),
-            DateTimeOffset.UtcNow.AddYears(5));
+            DateTimeOffset.UtcNow.AddDays(-1), DateTimeOffset.UtcNow.AddYears(5));
 
-        // Export PEM format
-        var certPem = cert.ExportCertificatePem();
-        var keyPem = rsa.ExportRSAPrivateKeyPem();
-
-        await File.WriteAllTextAsync(certPath, certPem);
-        await File.WriteAllTextAsync(keyPath, keyPem);
+        await File.WriteAllTextAsync(certPath, cert.ExportCertificatePem());
+        await File.WriteAllTextAsync(keyPath, rsa.ExportRSAPrivateKeyPem());
 
         result.Generated.Add(certPath);
         result.Generated.Add(keyPath);
     }
 
-    private static string GenerateTestCsproj(SltManifest manifest)
-    {
-        return $"""
-            <Project Sdk="Microsoft.NET.Sdk">
-              <PropertyGroup>
-                <TargetFramework>net8.0</TargetFramework>
-                <IsPackable>false</IsPackable>
-                <Nullable>enable</Nullable>
-                <ImplicitUsings>enable</ImplicitUsings>
-              </PropertyGroup>
+    #endregion
 
-              <ItemGroup>
-                <PackageReference Include="Microsoft.NET.Test.Sdk" Version="17.12.0" />
-                <PackageReference Include="MSTest.TestAdapter" Version="3.7.3" />
-                <PackageReference Include="MSTest.TestFramework" Version="3.7.3" />
-              </ItemGroup>
-
-              <ItemGroup>
-                <ProjectReference Include="..\..\{Path.GetDirectoryName(manifest.ServiceProject)}\FinPlat.TestContainers.csproj" 
-                                  Condition="Exists('..\..\{Path.GetDirectoryName(manifest.ServiceProject)}\FinPlat.TestContainers.csproj')" />
-                <!-- Or use NuGet: <PackageReference Include="FinPlat.TestContainers" Version="*" /> -->
-              </ItemGroup>
-
-              <ItemGroup>
-                <Content Include="Scenarios\**\*" CopyToOutputDirectory="PreserveNewest" />
-              </ItemGroup>
-            </Project>
-            """;
-    }
+    #region Test class — driven by manifest.ExternalApis + MessageEnvelope + Tests.*
 
     private static string GenerateTestClass(SltManifest manifest, WorkerConfig worker, string className)
     {
-        var ns = manifest.Tests.Namespace ?? $"{className}.SltTests";
+        var ns = manifest.Tests.Namespace ?? $"{manifest.ServiceName}.SltTests";
         var queueName = worker.QueueName;
+        var timeout = manifest.Tests.ProcessingTimeoutSeconds;
+        var pollInterval = manifest.Tests.PollingIntervalSeconds;
 
-        var apiMocks = string.Join("\n", manifest.ExternalApis.Select(a =>
-            $"                mock.OnAny(\"{a.BasePath}\", 200, \"\"\"{a.DefaultResponse}\"\"\");"));
+        // Build mock setup from ExternalApis — purely driven by manifest
+        var mockLines = new StringBuilder();
+        foreach (var api in manifest.ExternalApis)
+        {
+            var methodCall = api.Method.ToUpperInvariant() switch
+            {
+                "POST" => $"mock.OnPost(\"{api.BasePath}\", {api.DefaultStatusCode}, \"\"\"{api.DefaultResponse}\"\"\");",
+                "GET" => $"mock.OnGet(\"{api.BasePath}\", {api.DefaultStatusCode}, \"\"\"{api.DefaultResponse}\"\"\");",
+                _ => $"mock.OnAny(\"{api.BasePath}\", {api.DefaultStatusCode}, \"\"\"{api.DefaultResponse}\"\"\");"
+            };
+            mockLines.AppendLine($"                {methodCall}");
 
-        var wireBlobs = string.Join("\n", manifest.Infrastructure.BlobContainers.Select(b =>
-            $"                    .Blob(\"{b}\")"));
-        var wireTables = string.Join("\n", manifest.Infrastructure.Tables.Select(t =>
-            $"                    .Table(\"{t}\")"));
+            // Additional routes
+            if (api.AdditionalRoutes != null)
+            {
+                foreach (var route in api.AdditionalRoutes)
+                {
+                    var routeCall = route.Method.ToUpperInvariant() switch
+                    {
+                        "POST" => $"mock.OnPost(\"{route.Path}\", {route.StatusCode}, \"\"\"{route.Response}\"\"\");",
+                        "GET" => $"mock.OnGet(\"{route.Path}\", {route.StatusCode}, \"\"\"{route.Response}\"\"\");",
+                        _ => $"mock.OnAny(\"{route.Path}\", {route.StatusCode}, \"\"\"{route.Response}\"\"\");"
+                    };
+                    mockLines.AppendLine($"                {routeCall}");
+                }
+            }
+        }
+        mockLines.AppendLine("                mock.OnUnmatched(200, \"\"\"[]\"\"\");");
+
+        // Build wire setup from manifest.Infrastructure
+        var wireLines = new StringBuilder();
+        wireLines.Append($"                wire.Queue(\"{queueName}\")");
+        foreach (var table in manifest.Infrastructure.Tables)
+            wireLines.Append($"\n                    .Table(\"{table}\")");
+        foreach (var blob in manifest.Infrastructure.BlobContainers)
+            wireLines.Append($"\n                    .Blob(\"{blob}\")");
+        if (manifest.Infrastructure.UseTokenAuth)
+            wireLines.Append("\n                    .UseTokenAuth()");
+        // Wire the first API (user can customize)
+        if (manifest.ExternalApis.Count > 0)
+            wireLines.Append($"\n                    .MockApi(\"services\", \"{manifest.ExternalApis[0].ConfigKey}\")");
+        wireLines.Append(";");
+
+        // Message envelope helper — driven by manifest.MessageEnvelope
+        var envelopeHelper = GenerateEnvelopeHelper(manifest.MessageEnvelope);
 
         return $$"""
             using System.Text;
@@ -325,13 +391,15 @@ public static class SltGenerator
             using System.Text.Json.Nodes;
             using FinPlat.TestContainers;
             using FinPlat.TestContainers.Builder;
+            using FinPlat.TestContainers.Config;
+            using FinPlat.TestContainers.Containers;
             using Microsoft.VisualStudio.TestTools.UnitTesting;
 
             namespace {{ns}};
 
             /// <summary>
             /// SLT tests for {{worker.Name}}.
-            /// Auto-generated by dotnet-slt. Customize scenarios and assertions as needed.
+            /// Generated by dotnet-slt. Customize mock responses and scenarios as needed.
             /// </summary>
             [TestClass]
             [TestCategory("SLT")]
@@ -350,27 +418,23 @@ public static class SltGenerator
                     _env = await new TestEnvironmentBuilder()
                         .AddAzurite(opts =>
                         {
-                            opts.UseTokenAuth = true;
+                            opts.UseTokenAuth = {{manifest.Infrastructure.UseTokenAuth.ToString().ToLower()}};
                             opts.ExternalCertificate = cert;
                         })
                         .AddMockApi("services", mock =>
                         {
-            {{apiMocks}}
-                            mock.OnUnmatched(200, "{}");
+            {{mockLines}}
                         })
-                        .AddApplication("{{manifest.ServiceName}}", app =>
+                        .AddApplication("worker", app =>
                         {
-                            app.FromDockerfile("docker/Dockerfile.slt", contextPath: sltContext);
+                            app.FromDockerfile(
+                                dockerfilePath: "docker/Dockerfile.slt",
+                                contextPath: sltContext);
                             app.WithEnv("WorkerNames", "{{worker.Name}}");
-                            app.WithEnv("Logging__LogLevel__Default", "Information");
                         })
-                        .Wire("{{manifest.ServiceName}}", wire =>
+                        .Wire("worker", wire =>
                         {
-                            wire.Queue("{{queueName}}")
-            {{wireBlobs}}
-            {{wireTables}}
-                                .UseTokenAuth()
-                                .MockApi("services", "CollectorUri");
+            {{wireLines}}
                         })
                         .BuildAsync();
                 }
@@ -388,68 +452,70 @@ public static class SltGenerator
                 }
 
                 [TestMethod]
-                public async Task HappyPath_MessageProcessedSuccessfully()
+                public async Task {{className}}_HappyPath_MessageProcessed()
                 {
-                    // Arrange — load scenario fixture
-                    var messageJson = await ReadScenarioAsync("happy-path.json");
+                    var messageJson = await ReadScenarioFileAsync("happy-path.json");
+                    await _env.Queue("{{queueName}}").SendAsync(WrapMessage(messageJson));
 
-                    // Act — send to queue
-                    await _env.Queue("{{queueName}}").SendAsync(WrapInEventEntity(messageJson));
-                    await Task.Delay(TimeSpan.FromSeconds(15));
-
-                    // Assert — message was dequeued
-                    var queueCount = await _env.Queue("{{queueName}}").GetMessageCountAsync();
-                    Assert.AreEqual(0, queueCount, "Message should be dequeued from main queue");
+                    await WaitForProcessingAsync(async () =>
+                    {
+                        var count = await _env.Queue("{{queueName}}").GetMessageCountAsync();
+                        Assert.AreEqual(0, count, "Message should be dequeued after processing");
+                    });
                 }
 
                 [TestMethod]
-                public async Task MalformedMessage_HandledGracefully()
+                public async Task {{className}}_MalformedMessage_DequeuedWithoutCrash()
                 {
-                    // Act — send empty JSON
-                    await _env.Queue("{{queueName}}").SendAsync(WrapInEventEntity("{}"));
-                    await Task.Delay(TimeSpan.FromSeconds(15));
+                    await _env.Queue("{{queueName}}").SendAsync(WrapMessage("{}"));
 
-                    // Assert — worker didn't crash (message removed from queue)
-                    var queueCount = await _env.Queue("{{queueName}}").GetMessageCountAsync();
-                    Assert.AreEqual(0, queueCount);
+                    await WaitForProcessingAsync(async () =>
+                    {
+                        var count = await _env.Queue("{{queueName}}").GetMessageCountAsync();
+                        Assert.AreEqual(0, count, "Malformed message should be dequeued gracefully");
+                    });
                 }
 
                 [TestMethod]
-                public async Task WorkerRemainsHealthy_AfterProcessing()
+                public async Task {{className}}_WorkerRemainsHealthy_AfterProcessing()
                 {
-                    // Send first message
-                    var msg = await ReadScenarioAsync("happy-path.json");
-                    await _env.Queue("{{queueName}}").SendAsync(WrapInEventEntity(msg));
-                    await Task.Delay(TimeSpan.FromSeconds(15));
+                    var msg = await ReadScenarioFileAsync("happy-path.json");
+                    await _env.Queue("{{queueName}}").SendAsync(WrapMessage(msg));
+                    await WaitForProcessingAsync(async () =>
+                    {
+                        Assert.AreEqual(0, await _env.Queue("{{queueName}}").GetMessageCountAsync());
+                    });
 
-                    // Send second to prove worker is still alive
-                    await _env.Queue("{{queueName}}").SendAsync(WrapInEventEntity(msg));
-                    await Task.Delay(TimeSpan.FromSeconds(15));
-
-                    var queueCount = await _env.Queue("{{queueName}}").GetMessageCountAsync();
-                    Assert.AreEqual(0, queueCount, "Worker should still be processing after first message");
+                    // Second message proves worker is still alive
+                    await _env.Queue("{{queueName}}").SendAsync(WrapMessage(msg));
+                    await WaitForProcessingAsync(async () =>
+                    {
+                        Assert.AreEqual(0, await _env.Queue("{{queueName}}").GetMessageCountAsync(),
+                            "Worker should still be alive after first message");
+                    });
                 }
 
                 #region Helpers
-                private static string WrapInEventEntity(string eventJson)
-                {
-                    var envelope = new JsonObject
-                    {
-                        ["Event"] = JsonNode.Parse(eventJson),
-                        ["EventType"] = "OrderCreation",
-                        ["Properties"] = new JsonObject
-                        {
-                            ["EventHubMessageId"] = Guid.NewGuid().ToString(),
-                            ["EventHubMessageQueueDate"] = DateTime.UtcNow.ToString("o")
-                        }
-                    };
-                    return Convert.ToBase64String(Encoding.UTF8.GetBytes(envelope.ToJsonString()));
-                }
 
-                private static async Task<string> ReadScenarioAsync(string fileName)
+            {{envelopeHelper}}
+
+                private static async Task<string> ReadScenarioFileAsync(string fileName)
                 {
                     var path = Path.Combine(AppContext.BaseDirectory, "Scenarios", "{{className}}", fileName);
                     return await File.ReadAllTextAsync(path);
+                }
+
+                private static async Task WaitForProcessingAsync(Func<Task> assertion, int timeoutSeconds = {{timeout}})
+                {
+                    var deadline = DateTime.UtcNow.AddSeconds(timeoutSeconds);
+                    Exception? last = null;
+                    while (DateTime.UtcNow < deadline)
+                    {
+                        try { await assertion(); return; }
+                        catch (Exception ex) { last = ex; await Task.Delay({{pollInterval * 1000}}); }
+                    }
+                    throw new TimeoutException(
+                        $"Assertion failed after {timeoutSeconds}s: {last?.Message}", last);
                 }
 
                 private static string GetSltContext()
@@ -458,65 +524,160 @@ public static class SltGenerator
                     while (dir != null && !Directory.Exists(Path.Combine(dir.FullName, ".slt")))
                         dir = dir.Parent;
                     return dir != null ? Path.Combine(dir.FullName, ".slt")
-                        : throw new InvalidOperationException("Cannot find .slt directory");
+                        : throw new InvalidOperationException("Cannot find .slt directory. Run from repo root.");
                 }
+
                 #endregion
             }
             """;
     }
 
-    private static string GenerateScenarioFile()
+    /// <summary>
+    /// Generates message wrapping helper based on manifest.MessageEnvelope config.
+    /// No hardcoded EventEntityV1 or Collector knowledge.
+    /// </summary>
+    private static string GenerateEnvelopeHelper(MessageEnvelopeConfig envelope)
     {
-        return """
+        return envelope.Format switch
+        {
+            "base64-json" => $$"""
+                    private static string WrapMessage(string eventJson)
+                    {
+                        var eventNode = JsonNode.Parse(eventJson);
+                        var wrapper = new JsonObject
+                        {
+                            ["Event"] = eventNode,
+                            ["EventType"] = "{{envelope.EventType}}",
+                            ["Properties"] = new JsonObject
+                            {
+                                ["MessageId"] = Guid.NewGuid().ToString(),
+                                ["EnqueuedTime"] = DateTime.UtcNow.ToString("o")
+                            }
+                        };
+                        return Convert.ToBase64String(Encoding.UTF8.GetBytes(wrapper.ToJsonString()));
+                    }
+            """,
+            "raw-json" => """
+                    private static string WrapMessage(string eventJson) => eventJson;
+            """,
+            "base64-raw" => """
+                    private static string WrapMessage(string eventJson)
+                        => Convert.ToBase64String(Encoding.UTF8.GetBytes(eventJson));
+            """,
+            _ => """
+                    private static string WrapMessage(string eventJson) => eventJson;
+            """
+        };
+    }
+
+    #endregion
+
+    #region Test csproj
+
+    private static string GenerateTestCsproj(SltManifest manifest, string repoRoot)
+    {
+        var hasTestProps = File.Exists(Path.Combine(repoRoot, "props", "Test.props"));
+        var testPropsLine = hasTestProps
+            ? "\n  <Import Project=\"$(ProjectDir)..\\..\\props\\Test.props\" />\n"
+            : "";
+        var ns = manifest.Tests.Namespace ?? $"{manifest.ServiceName}.SltTests";
+
+        return $"""
+            <Project Sdk="Microsoft.NET.Sdk">
+            {testPropsLine}
+              <PropertyGroup>
+                <RootNamespace>{ns}</RootNamespace>
+                <Nullable>enable</Nullable>
+                <ImplicitUsings>enable</ImplicitUsings>
+              </PropertyGroup>
+
+              <ItemGroup>
+                <PackageReference Include="Microsoft.NET.Test.Sdk" Version="18.4.0" />
+                <PackageReference Include="MSTest.TestAdapter" Version="4.2.1" />
+                <PackageReference Include="MSTest.TestFramework" Version="4.2.1" />
+              </ItemGroup>
+
+              <ItemGroup>
+                <!-- Adjust path to FinPlat.TestContainers project or use NuGet package -->
+                <ProjectReference Include="..\..\..\FinPlat.TestContainers\src\FinPlat.TestContainers\FinPlat.TestContainers.csproj" />
+              </ItemGroup>
+
+              <ItemGroup>
+                <None Update="Scenarios\**\*.json">
+                  <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
+                </None>
+              </ItemGroup>
+
+            </Project>
+            """;
+    }
+
+    #endregion
+
+    #region Utility generators
+
+    private static string GenerateScenarioFile(WorkerConfig worker)
+    {
+        return $$"""
             {
-              "_comment": "Replace with your actual test message payload",
+              "_comment": "Replace with a real message payload for {{worker.Name}}",
+              "_hint": "Copy a message from your unit test fixtures (e.g. test data JSON files)",
               "id": "SLT-TEST-001",
-              "state": "closed",
-              "summary": {
-                "purchaseRecordId": "SLT-TEST-001",
-                "product": {
-                  "productId": "TEST-PRODUCT-001"
-                }
-              }
+              "state": "closed"
             }
+            """;
+    }
+
+    private static string GeneratePublishScript(SltManifest manifest)
+    {
+        var project = manifest.Docker.PublishProject ?? manifest.ServiceProject;
+        return $$"""
+            # Publish the service for SLT Docker build
+            # Run from repo root: powershell .slt/publish.ps1
+            param([string]$Configuration = "Release")
+            $repoRoot = Split-Path -Parent $PSScriptRoot
+            $output = Join-Path $PSScriptRoot "publish"
+            Write-Host "Publishing {{manifest.ServiceName}}..."
+            dotnet publish "$repoRoot/{{project.Replace('\\', '/')}}" -c $Configuration -o $output
+            if ($LASTEXITCODE -eq 0) { Write-Host "Done: $output" -ForegroundColor Green }
+            else { Write-Host "Failed" -ForegroundColor Red; exit 1 }
             """;
     }
 
     private static string GenerateGitignore()
     {
         return """
-            # Generated at runtime — do not commit
-            .generated/
-            .certs/
+            # Pre-published binaries — rebuilt each run
+            publish/
             """;
     }
+
+    #endregion
+
+    #region Shared helpers
 
     private static async Task WriteIfAllowedAsync(
         string path, string content, GenerationOptions options, GenerationResult result)
     {
-        if (options.DryRun)
-        {
-            result.Planned.Add(path);
-            return;
-        }
-
-        if (File.Exists(path) && !options.Overwrite)
-        {
-            result.Skipped.Add(path);
-            return;
-        }
-
+        if (options.DryRun) { result.Planned.Add(path); return; }
+        if (File.Exists(path) && !options.Overwrite) { result.Skipped.Add(path); return; }
         Directory.CreateDirectory(Path.GetDirectoryName(path)!);
         await File.WriteAllTextAsync(path, content);
         result.Generated.Add(path);
     }
 
-    private static string ToPascalCase(string name)
+    private static string DeriveClassName(string workerName)
     {
-        return string.Concat(
-            name.Split(['-', '_', '.'], StringSplitOptions.RemoveEmptyEntries)
-                .Select(w => char.ToUpperInvariant(w[0]) + w[1..]));
+        return workerName
+            .Replace("QueueWorkerV1", "")
+            .Replace("QueueWorkerV2", "")
+            .Replace("QueueWorkerV8", "")
+            .Replace("QueueWorker", "")
+            .Replace("Worker", "")
+            .Replace("Organization", "Org");
     }
+
+    #endregion
 }
 
 public class GenerationOptions

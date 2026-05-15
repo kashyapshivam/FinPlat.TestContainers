@@ -6,35 +6,36 @@ namespace FinPlat.Slt.Cli.Detection;
 
 /// <summary>
 /// Auto-detects service configuration from repo structure.
-/// Scans for projects, workers, queues, API dependencies, and config files.
+/// Populates all manifest fields so the generator needs zero domain knowledge.
 /// </summary>
 public static class ServiceDetector
 {
-    /// <summary>
-    /// Detects service configuration from the given repo root.
-    /// Returns a populated SltManifest with best-guess values.
-    /// </summary>
+    // Known false-positive URI keys that aren't real external API dependencies
+    private static readonly HashSet<string> IgnoredUriKeys = new(StringComparer.OrdinalIgnoreCase)
+    {
+        "Uri", "SwaggerUri", "ClusterUri", "BaseUri", "AzureAdInstance",
+        "KeyVaultUri" // KeyVault handled separately
+    };
+
     public static async Task<SltManifest> DetectAsync(string repoRoot)
     {
         var manifest = new SltManifest();
 
-        // 1. Find solution file
-        var slnFiles = Directory.GetFiles(repoRoot, "*.sln", SearchOption.TopDirectoryOnly);
-        if (slnFiles.Length == 0)
-            slnFiles = Directory.GetFiles(repoRoot, "*.sln", SearchOption.AllDirectories);
-
-        // 2. Find Worker/Service projects
+        // 1. Find service/worker project
         var workerProject = await FindWorkerProjectAsync(repoRoot);
         if (workerProject != null)
         {
             manifest.ServiceProject = Path.GetRelativePath(repoRoot, workerProject);
             manifest.ServiceName = Path.GetFileNameWithoutExtension(workerProject)
-                .Replace(".Worker", "").Replace(".Service", "");
+                .Replace(".Worker", "").Replace(".Service", "").Replace(".WorkerService", "");
             manifest.Docker.PublishProject = manifest.ServiceProject;
         }
 
-        // 3. Detect workers and queues from config
-        var (workers, apis) = await DetectWorkersAndApisAsync(repoRoot, workerProject);
+        // 2. Detect Docker settings from existing Dockerfile/config
+        DetectDockerSettings(repoRoot, manifest);
+
+        // 3. Detect workers and APIs from config files
+        var (workers, apis) = await DetectWorkersAndApisAsync(repoRoot);
         manifest.Workers = workers;
         manifest.ExternalApis = apis;
 
@@ -43,66 +44,114 @@ public static class ServiceDetector
         if (testProject != null)
         {
             manifest.Tests.ProjectPath = Path.GetRelativePath(repoRoot, testProject);
-            manifest.Tests.Namespace = Path.GetFileNameWithoutExtension(testProject)
-                .Replace(".csproj", "");
+            manifest.Tests.Namespace = DetectNamespace(testProject)
+                ?? $"CFS.{manifest.ServiceName}.SltTests";
         }
         else
         {
-            var servicePascal = ToPascalCase(manifest.ServiceName);
-            manifest.Tests.ProjectPath = $"tests/{servicePascal}.SltTests/{servicePascal}.SltTests.csproj";
-            manifest.Tests.Namespace = $"{servicePascal}.SltTests";
+            manifest.Tests.ProjectPath = $"tests/{manifest.ServiceName}.SltTests/{manifest.ServiceName}.SltTests.csproj";
+            manifest.Tests.Namespace = $"CFS.{manifest.ServiceName}.SltTests";
         }
 
-        // 5. Detect infrastructure needs
-        manifest.Infrastructure.UseTokenAuth = true; // default for FinPlat services
-        manifest.Infrastructure.UseHttpsProxy = true;
-
-        // Detect blob containers and tables from config
+        // 5. Detect infrastructure
         var (blobs, tables) = DetectStorageRequirements(repoRoot);
         manifest.Infrastructure.BlobContainers = blobs;
         manifest.Infrastructure.Tables = tables;
+        manifest.Infrastructure.UseTokenAuth = true;
+        manifest.Infrastructure.UseHttpsProxy = true;
+        manifest.Infrastructure.ProxyAuthEndpoint = true;
+
+        // 6. Detect message envelope format
+        DetectMessageEnvelope(repoRoot, manifest);
 
         return manifest;
     }
 
-    private static async Task<string?> FindWorkerProjectAsync(string repoRoot)
+    private static void DetectDockerSettings(string repoRoot, SltManifest manifest)
     {
-        // Look for Worker projects by name pattern
-        var projects = Directory.GetFiles(repoRoot, "*.csproj", SearchOption.AllDirectories)
-            .Where(p => !p.Contains("Test", StringComparison.OrdinalIgnoreCase))
-            .Where(p => !p.Contains("node_modules"))
-            .Where(p => !p.Contains(Path.Combine("bin", "")))
-            .Where(p => !p.Contains(Path.Combine("obj", "")))
-            .ToList();
+        // Check if there's an existing Dockerfile with clues about base image / entry DLL
+        var existingDockerfile = Path.Combine(repoRoot, ".slt", "docker", "Dockerfile.slt");
+        if (File.Exists(existingDockerfile))
+        {
+            var content = File.ReadAllText(existingDockerfile);
 
-        // Priority 1: Project with "Worker" in name
-        var workerProj = projects.FirstOrDefault(p =>
-            Path.GetFileName(p).Contains("Worker", StringComparison.OrdinalIgnoreCase));
-        if (workerProj != null) return workerProj;
+            // Detect base image
+            var fromMatch = Regex.Match(content, @"FROM\s+(mcr\.microsoft\.com/dotnet/aspnet:\S+)");
+            if (fromMatch.Success)
+                manifest.Docker.BaseImage = fromMatch.Groups[1].Value;
 
-        // Priority 2: Project with "Service" in name
-        var serviceProj = projects.FirstOrDefault(p =>
-            Path.GetFileName(p).Contains("Service", StringComparison.OrdinalIgnoreCase));
-        if (serviceProj != null) return serviceProj;
+            // Detect entry DLL
+            var entryMatch = Regex.Match(content, @"ENTRYPOINT\s+\[""dotnet"",\s*""(.+\.dll)""\]");
+            if (entryMatch.Success)
+                manifest.Docker.EntryDll = entryMatch.Groups[1].Value;
 
-        // Priority 3: Project in src/ directory
-        var srcProj = projects.FirstOrDefault(p =>
-            p.Contains(Path.Combine("src", ""), StringComparison.OrdinalIgnoreCase));
-        return srcProj ?? projects.FirstOrDefault();
+            // Detect config target path
+            var configMatch = Regex.Match(content, @"COPY\s+docker/config\.docker\.json\s+(.+)");
+            if (configMatch.Success)
+                manifest.Docker.ConfigTargetPath = configMatch.Groups[1].Value.Trim();
+
+            // Detect cert install pattern (Azure Linux vs Debian)
+            if (content.Contains("/etc/pki/ca-trust"))
+            {
+                manifest.Docker.CertInstall = new CertInstallConfig
+                {
+                    CertDestination = "/etc/pki/ca-trust/source/anchors/azurite.crt",
+                    UpdateCommand = "update-ca-trust"
+                };
+            }
+
+            manifest.Docker.Dockerfile = "docker/Dockerfile.slt"; // Use existing
+        }
+        else
+        {
+            // Default: derive entry DLL from project name
+            var projectName = Path.GetFileNameWithoutExtension(manifest.ServiceProject);
+            manifest.Docker.EntryDll = $"{projectName}.dll";
+        }
+
+        // Detect workload identity usage
+        var configFiles = Directory.GetFiles(repoRoot, "config*.json", SearchOption.AllDirectories)
+            .Where(f => !f.Contains("bin") && !f.Contains("obj") && !f.Contains("node_modules"));
+        foreach (var cf in configFiles)
+        {
+            try
+            {
+                var json = File.ReadAllText(cf);
+                if (json.Contains("UseWorkloadIdentity"))
+                {
+                    manifest.Docker.UseWorkloadIdentity = true;
+                    break;
+                }
+            }
+            catch { }
+        }
     }
 
-    private static async Task<(List<WorkerConfig>, List<ApiDependency>)> DetectWorkersAndApisAsync(
-        string repoRoot, string? workerProject)
+    private static async Task<string?> FindWorkerProjectAsync(string repoRoot)
+    {
+        var projects = Directory.GetFiles(repoRoot, "*.csproj", SearchOption.AllDirectories)
+            .Where(p => !p.Contains("Test", StringComparison.OrdinalIgnoreCase))
+            .Where(p => !p.Contains("node_modules") && !p.Contains("bin") && !p.Contains("obj"))
+            .ToList();
+
+        // Priority: Worker > Service > src/
+        return projects.FirstOrDefault(p => Path.GetFileName(p).Contains("Worker", StringComparison.OrdinalIgnoreCase))
+            ?? projects.FirstOrDefault(p => Path.GetFileName(p).Contains("Service", StringComparison.OrdinalIgnoreCase))
+            ?? projects.FirstOrDefault(p => p.Contains(Path.Combine("src", ""), StringComparison.OrdinalIgnoreCase))
+            ?? projects.FirstOrDefault();
+    }
+
+    private static async Task<(List<WorkerConfig>, List<ApiDependency>)> DetectWorkersAndApisAsync(string repoRoot)
     {
         var workers = new List<WorkerConfig>();
         var apis = new List<ApiDependency>();
 
-        // Search for config files
-        var configFiles = new List<string>();
-        configFiles.AddRange(Directory.GetFiles(repoRoot, "appsettings*.json", SearchOption.AllDirectories)
-            .Where(f => !f.Contains("bin") && !f.Contains("obj")));
-        configFiles.AddRange(Directory.GetFiles(repoRoot, "config*.json", SearchOption.AllDirectories)
-            .Where(f => !f.Contains("bin") && !f.Contains("obj") && !f.Contains("node_modules")));
+        var configFiles = Directory.GetFiles(repoRoot, "*.json", SearchOption.AllDirectories)
+            .Where(f => (f.Contains("appsettings", StringComparison.OrdinalIgnoreCase)
+                      || f.Contains("config", StringComparison.OrdinalIgnoreCase))
+                      && !f.Contains("bin") && !f.Contains("obj") && !f.Contains("node_modules")
+                      && !f.Contains("package.json") && !f.Contains("tsconfig"))
+            .ToList();
 
         foreach (var configFile in configFiles)
         {
@@ -111,7 +160,7 @@ public static class ServiceDetector
                 var json = await File.ReadAllTextAsync(configFile);
                 var doc = JsonDocument.Parse(json);
 
-                // Detect queue workers from AzureQueueWorkerConfiguration
+                // Detect queue workers
                 if (doc.RootElement.TryGetProperty("AzureQueueWorkerConfiguration", out var queueConfig))
                 {
                     foreach (var item in queueConfig.EnumerateArray())
@@ -129,10 +178,10 @@ public static class ServiceDetector
                     }
                 }
 
-                // Detect API dependencies from URI config keys
+                // Detect API dependencies (URI keys)
                 DetectApiDependencies(doc.RootElement, apis);
             }
-            catch { /* skip unparseable files */ }
+            catch { }
         }
 
         return (workers, apis);
@@ -140,23 +189,22 @@ public static class ServiceDetector
 
     private static void DetectApiDependencies(JsonElement element, List<ApiDependency> apis)
     {
-        var uriPattern = new Regex(@"^(https?://|http://)", RegexOptions.IgnoreCase);
-        var knownUriKeys = new[] { "CollectorUri", "DisplayCatalogUri", "TaxUri", "BillingGroupUri",
-            "FIServiceUri", "QuoteServiceUri", "KeyVaultUri" };
-
         foreach (var prop in element.EnumerateObject())
         {
             if (prop.Value.ValueKind == JsonValueKind.String &&
-                prop.Name.EndsWith("Uri", StringComparison.OrdinalIgnoreCase))
+                prop.Name.EndsWith("Uri", StringComparison.OrdinalIgnoreCase) &&
+                !IgnoredUriKeys.Contains(prop.Name))
             {
-                var key = prop.Name;
-                if (!apis.Any(a => a.ConfigKey == key))
+                if (!apis.Any(a => a.ConfigKey == prop.Name))
                 {
+                    var basePath = "/" + prop.Name.Replace("Uri", "").ToLowerInvariant();
                     apis.Add(new ApiDependency
                     {
-                        ConfigKey = key,
-                        BasePath = $"/{key.Replace("Uri", "").ToLowerInvariant()}",
-                        DefaultResponse = "[]"
+                        ConfigKey = prop.Name,
+                        BasePath = basePath,
+                        Method = "ANY",
+                        DefaultResponse = "[]",
+                        DefaultStatusCode = 200
                     });
                 }
             }
@@ -169,13 +217,22 @@ public static class ServiceDetector
 
     private static string? FindTestProject(string repoRoot)
     {
-        return Directory.GetFiles(repoRoot, "*SltTest*.csproj", SearchOption.AllDirectories)
-            .FirstOrDefault()
-            ?? Directory.GetFiles(repoRoot, "*IntegrationTest*.csproj", SearchOption.AllDirectories)
-                .FirstOrDefault();
+        return Directory.GetFiles(repoRoot, "*SltTest*.csproj", SearchOption.AllDirectories).FirstOrDefault()
+            ?? Directory.GetFiles(repoRoot, "*IntegrationTest*.csproj", SearchOption.AllDirectories).FirstOrDefault();
     }
 
-    private static (List<string> Blobs, List<string> Tables) DetectStorageRequirements(string repoRoot)
+    private static string? DetectNamespace(string csprojPath)
+    {
+        try
+        {
+            var content = File.ReadAllText(csprojPath);
+            var match = Regex.Match(content, @"<RootNamespace>(.+?)</RootNamespace>");
+            return match.Success ? match.Groups[1].Value : null;
+        }
+        catch { return null; }
+    }
+
+    private static (List<string>, List<string>) DetectStorageRequirements(string repoRoot)
     {
         var blobs = new List<string>();
         var tables = new List<string>();
@@ -188,12 +245,10 @@ public static class ServiceDetector
         {
             try
             {
-                var json = File.ReadAllText(configFile);
-                var doc = JsonDocument.Parse(json);
-
-                // Look for table configurations
+                var doc = JsonDocument.Parse(File.ReadAllText(configFile));
                 foreach (var prop in doc.RootElement.EnumerateObject())
                 {
+                    // Tables
                     if (prop.Name.Contains("TableIndex") && prop.Value.ValueKind == JsonValueKind.Array)
                     {
                         foreach (var item in prop.Value.EnumerateArray())
@@ -206,6 +261,15 @@ public static class ServiceDetector
                             }
                         }
                     }
+
+                    // Blobs — detect from container references in code/config
+                    if (prop.Name.Contains("Container", StringComparison.OrdinalIgnoreCase)
+                        && prop.Value.ValueKind == JsonValueKind.String)
+                    {
+                        var blobName = prop.Value.GetString();
+                        if (blobName != null && !blobs.Contains(blobName))
+                            blobs.Add(blobName);
+                    }
                 }
             }
             catch { }
@@ -214,20 +278,40 @@ public static class ServiceDetector
         return (blobs, tables);
     }
 
-    private static string DeriveQueueName(string workerName)
+    private static void DetectMessageEnvelope(string repoRoot, SltManifest manifest)
     {
-        // "BillingPurchaseLineOrganizationQueueWorkerV1" → "billingpurchaselineorganization"
-        var name = workerName
-            .Replace("QueueWorkerV1", "", StringComparison.OrdinalIgnoreCase)
-            .Replace("QueueWorker", "", StringComparison.OrdinalIgnoreCase)
-            .Replace("Worker", "", StringComparison.OrdinalIgnoreCase);
-        return name.ToLowerInvariant();
+        // Look for EventEntity patterns in source code
+        var csFiles = Directory.GetFiles(repoRoot, "*.cs", SearchOption.AllDirectories)
+            .Where(f => !f.Contains("bin") && !f.Contains("obj"))
+            .Take(500); // limit scan
+
+        foreach (var file in csFiles)
+        {
+            try
+            {
+                var content = File.ReadAllText(file);
+                if (content.Contains("EventEntityV1") || content.Contains("EventEntity"))
+                {
+                    manifest.MessageEnvelope.Format = "base64-json";
+                    manifest.MessageEnvelope.EventType = "OrderCreation";
+                    return;
+                }
+            }
+            catch { }
+        }
+
+        // Default: raw JSON (simplest assumption)
+        manifest.MessageEnvelope.Format = "raw-json";
     }
 
-    private static string ToPascalCase(string name)
+    private static string DeriveQueueName(string workerName)
     {
-        return string.Concat(
-            name.Split(['-', '_', '.'], StringSplitOptions.RemoveEmptyEntries)
-                .Select(w => char.ToUpperInvariant(w[0]) + w[1..]));
+        return workerName
+            .Replace("QueueWorkerV1", "", StringComparison.OrdinalIgnoreCase)
+            .Replace("QueueWorkerV2", "", StringComparison.OrdinalIgnoreCase)
+            .Replace("QueueWorkerV8", "", StringComparison.OrdinalIgnoreCase)
+            .Replace("QueueWorker", "", StringComparison.OrdinalIgnoreCase)
+            .Replace("Worker", "", StringComparison.OrdinalIgnoreCase)
+            .ToLowerInvariant();
     }
 }
