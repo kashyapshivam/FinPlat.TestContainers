@@ -1,4 +1,5 @@
 using System;
+using System.Collections.Generic;
 using System.Net.Http;
 using System.Text;
 using System.Text.Json;
@@ -31,6 +32,9 @@ public class StubDefinition
 
     /// <summary>Priority for stub matching (lower = higher priority). Default is 0 (highest).</summary>
     public int? Priority { get; set; }
+
+    /// <summary>When set, the stub only matches requests whose body contains this substring.</summary>
+    public string? BodyContains { get; set; }
 }
 
 /// <summary>
@@ -113,7 +117,7 @@ public class ManagedWireMockContainer : IAsyncDisposable
     {
         var requestBody = JsonSerializer.Serialize(new
         {
-            url = path
+            urlPathPattern = $".*{EscapeRegex(path)}.*"
         });
 
         var content = new StringContent(requestBody, Encoding.UTF8, "application/json");
@@ -205,20 +209,26 @@ public class ManagedWireMockContainer : IAsyncDisposable
 
     private static string BuildMappingJson(StubDefinition stub)
     {
-        object request;
+        // Build the request matcher as a dictionary for flexibility
+        var request = new Dictionary<string, object>();
+
         if (stub.IsPathPattern)
         {
-            request = stub.Method == "ANY"
-                ? (object)new { urlPathPattern = stub.Path }
-                : new { method = stub.Method, urlPathPattern = stub.Path };
-        }
-        else if (stub.Method == "ANY")
-        {
-            request = new { urlPath = stub.Path };
+            request["urlPathPattern"] = stub.Path;
         }
         else
         {
-            request = new { method = stub.Method, urlPath = stub.Path };
+            request["urlPath"] = stub.Path;
+        }
+
+        if (stub.Method != "ANY")
+        {
+            request["method"] = stub.Method;
+        }
+
+        if (!string.IsNullOrEmpty(stub.BodyContains))
+        {
+            request["bodyPatterns"] = new[] { new { contains = stub.BodyContains } };
         }
 
         var response = new

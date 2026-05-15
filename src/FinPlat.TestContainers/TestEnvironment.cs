@@ -112,7 +112,7 @@ public class TestEnvironment : IAsyncDisposable
         if (_azurite is null)
             throw new InvalidOperationException("Azurite was not added to the test environment.");
 
-        return new StorageAccessor(_azurite.ConnectionString);
+        return new StorageAccessor(_azurite.ConnectionString, _cert is not null);
     }
 
     /// <summary>
@@ -506,10 +506,12 @@ public class MockApiAccessor
 public class StorageAccessor
 {
     private readonly string _connectionString;
+    private readonly bool _bypassSsl;
 
-    internal StorageAccessor(string connectionString)
+    internal StorageAccessor(string connectionString, bool bypassSsl = false)
     {
         _connectionString = connectionString;
+        _bypassSsl = bypassSsl;
     }
 
     /// <summary>
@@ -517,21 +519,21 @@ public class StorageAccessor
     /// The container does not need to be pre-declared via wiring.
     /// </summary>
     public BlobAccessor Blobs(string containerName)
-        => new(_connectionString, containerName);
+        => new(_connectionString, containerName, _bypassSsl);
 
     /// <summary>
     /// Gets a <see cref="QueueAccessor"/> for the specified queue.
     /// The queue does not need to be pre-declared via wiring.
     /// </summary>
     public QueueAccessor Queues(string queueName)
-        => new(_connectionString, queueName);
+        => new(_connectionString, queueName, _bypassSsl);
 
     /// <summary>
     /// Gets a <see cref="TableAccessor"/> for the specified table.
     /// The table does not need to be pre-declared via wiring.
     /// </summary>
     public TableAccessor Tables(string tableName)
-        => new(_connectionString, tableName);
+        => new(_connectionString, tableName, _bypassSsl);
 
     /// <summary>
     /// Lists all blob containers in the storage account.
@@ -539,7 +541,9 @@ public class StorageAccessor
     /// </summary>
     public async Task<List<string>> ListContainersAsync()
     {
-        var serviceClient = new BlobServiceClient(_connectionString);
+        var options = new BlobClientOptions();
+        if (_bypassSsl) SslHelper.ConfigureSslBypass(options);
+        var serviceClient = new BlobServiceClient(_connectionString, options);
         var names = new List<string>();
         await foreach (var container in serviceClient.GetBlobContainersAsync())
         {
@@ -553,7 +557,9 @@ public class StorageAccessor
     /// </summary>
     public async Task<List<string>> ListQueuesAsync()
     {
-        var serviceClient = new QueueServiceClient(_connectionString);
+        var options = new QueueClientOptions();
+        if (_bypassSsl) SslHelper.ConfigureSslBypass(options);
+        var serviceClient = new QueueServiceClient(_connectionString, options);
         var names = new List<string>();
         await foreach (var queue in serviceClient.GetQueuesAsync())
         {

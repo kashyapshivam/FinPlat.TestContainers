@@ -47,6 +47,28 @@ public class MockApiBuilder
     }
 
     /// <summary>
+    /// Registers a POST stub that only matches when the request body contains the specified substring.
+    /// </summary>
+    /// <param name="path">URL path to match (e.g., "/api/submit").</param>
+    /// <param name="bodyContains">Substring that must be present in the request body.</param>
+    /// <param name="statusCode">HTTP response status code.</param>
+    /// <param name="body">Response body as a string.</param>
+    /// <param name="priority">Optional priority (lower = higher priority).</param>
+    public MockApiBuilder OnPost(string path, string bodyContains, int statusCode = 200, string body = "{}", int? priority = null)
+    {
+        Stubs.Add(new StubDefinition
+        {
+            Method = "POST",
+            Path = path,
+            StatusCode = statusCode,
+            ResponseBody = body,
+            BodyContains = bodyContains,
+            Priority = priority
+        });
+        return this;
+    }
+
+    /// <summary>
     /// Registers a stub that matches any HTTP method for the specified path.
     /// </summary>
     /// <param name="path">URL path to match.</param>
