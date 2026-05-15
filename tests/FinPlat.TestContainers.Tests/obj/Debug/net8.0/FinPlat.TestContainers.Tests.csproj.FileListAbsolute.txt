@@ -265,3 +265,4 @@ C:\Users\shivkashyap\repos\FinPlat.TestContainers\tests\FinPlat.TestContainers.T
 C:\Users\shivkashyap\repos\FinPlat.TestContainers\tests\FinPlat.TestContainers.Tests\obj\Debug\net8.0\FinPlat.TestContainers.Tests.pdb
 C:\Users\shivkashyap\repos\FinPlat.TestContainers\tests\FinPlat.TestContainers.Tests\obj\Debug\net8.0\FinPlat.TestContainers.Tests.genruntimeconfig.cache
 C:\Users\shivkashyap\repos\FinPlat.TestContainers\tests\FinPlat.TestContainers.Tests\obj\Debug\net8.0\ref\FinPlat.TestContainers.Tests.dll
+C:\Users\shivkashyap\repos\FinPlat.TestContainers\tests\FinPlat.TestContainers.Tests\obj\Debug\net8.0\FinPlat.TestContainers.Tests.sourcelink.json
