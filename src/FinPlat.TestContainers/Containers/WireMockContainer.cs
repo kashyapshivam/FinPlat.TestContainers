@@ -191,6 +191,41 @@ public class ManagedWireMockContainer : IAsyncDisposable
         response.EnsureSuccessStatusCode();
     }
 
+    /// <summary>
+    /// Configures a scenario-based stub mapping for response sequencing.
+    /// </summary>
+    /// <param name="stub">The stub definition to register.</param>
+    /// <param name="scenarioName">Name of the scenario.</param>
+    /// <param name="requiredState">Required scenario state to match (default: "Started").</param>
+    /// <param name="newState">New scenario state after matching (null = don't change).</param>
+    public async Task ConfigureScenarioStubAsync(StubDefinition stub, string scenarioName,
+        string requiredState = "Started", string? newState = null)
+    {
+        var mapping = BuildScenarioMappingJson(stub, scenarioName, requiredState, newState);
+        var content = new StringContent(mapping, Encoding.UTF8, "application/json");
+        var response = await _httpClient.PostAsync($"{Url}/__admin/mappings", content);
+        response.EnsureSuccessStatusCode();
+    }
+
+    /// <summary>
+    /// Resets all stub mappings to the default state.
+    /// </summary>
+    public async Task ResetMappingsAsync()
+    {
+        var response = await _httpClient.DeleteAsync($"{Url}/__admin/mappings");
+        response.EnsureSuccessStatusCode();
+    }
+
+    /// <summary>
+    /// Resets all WireMock scenarios back to "Started" state.
+    /// </summary>
+    public async Task ResetScenariosAsync()
+    {
+        var response = await _httpClient.PostAsync($"{Url}/__admin/scenarios/reset",
+            new StringContent("", Encoding.UTF8));
+        response.EnsureSuccessStatusCode();
+    }
+
     private static string EscapeRegex(string input)
     {
         return System.Text.RegularExpressions.Regex.Escape(input);
@@ -251,5 +286,45 @@ public class ManagedWireMockContainer : IAsyncDisposable
         }
 
         return json;
+    }
+
+    private static string BuildScenarioMappingJson(StubDefinition stub, string scenarioName,
+        string requiredState, string? newState)
+    {
+        var request = new Dictionary<string, object>();
+
+        if (stub.IsPathPattern)
+            request["urlPathPattern"] = stub.Path;
+        else
+            request["urlPath"] = stub.Path;
+
+        if (stub.Method != "ANY")
+            request["method"] = stub.Method;
+
+        if (!string.IsNullOrEmpty(stub.BodyContains))
+            request["bodyPatterns"] = new[] { new { contains = stub.BodyContains } };
+
+        var response = new
+        {
+            status = stub.StatusCode,
+            body = stub.ResponseBody,
+            headers = new { Content_Type = "application/json" }
+        };
+
+        var mappingDict = new Dictionary<string, object>
+        {
+            ["scenarioName"] = scenarioName,
+            ["requiredScenarioState"] = requiredState,
+            ["request"] = request,
+            ["response"] = response
+        };
+
+        if (newState != null)
+            mappingDict["newScenarioState"] = newState;
+
+        if (stub.Priority.HasValue)
+            mappingDict["priority"] = stub.Priority.Value;
+
+        return JsonSerializer.Serialize(mappingDict, new JsonSerializerOptions { PropertyNamingPolicy = JsonNamingPolicy.CamelCase });
     }
 }
