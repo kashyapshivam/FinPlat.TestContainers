@@ -365,3 +365,47 @@ Environment variables injected:
 - `AZURE_CLIENT_ID` = test client  
 - `AZURE_CLIENT_SECRET` = test secret
 - Storage endpoints → `https://nginx-proxy:10000/...`
+
+## Skill 10: Talking to Live Containers from Test Code
+
+Sometimes a test needs to reach into a running app container directly — to hit a health endpoint, an admin API, or to inspect logs after a failure. Use the `Application(...)` accessor on `TestEnvironment`.
+
+### Hit an HTTP endpoint on an app container
+
+The framework binds each app's exposed port to a random host port. Resolve it via `GetMappedPort` and build a `http://localhost:<port>` URL — the host can always reach it.
+
+```csharp
+using var httpClient = new HttpClient { Timeout = TimeSpan.FromSeconds(5) };
+
+var port = _env.Application("my-service").GetMappedPort(8080);
+using var response = await httpClient.GetAsync($"http://localhost:{port}/v1.0/ping");
+
+Assert.AreEqual(200, (int)response.StatusCode,
+    "Service should still be healthy after processing");
+```
+
+**Use this when:**
+- Verifying a downstream service stayed alive after a failure scenario (malformed message, retry storm, etc.)
+- Calling an admin/diagnostics endpoint not exposed via a queue/mock-api flow
+- Asserting service readiness independently of the `WithHttpHealthCheck` boot-time check
+
+**Do NOT use this when** another container needs to call the app — that's what `wire.AppUrl("target-app", "EnvVar")` is for (inter-container DNS via the shared network).
+
+### Read container logs from a test
+
+```csharp
+var logs = await _env.Application("my-service").GetLogsAsync();
+Console.WriteLine(logs);   // surfaces in test output
+
+// Or use the higher-level log assertions
+var assertions = await _env.AssertLogsAsync("my-service");
+assertions.DoesNotContain("FATAL").HasNoErrors().Verify();
+```
+
+### `ManagedAppContainer` API (returned by `Application(...)`)
+
+| Member | Use |
+|---|---|
+| `Name` | Container name / network alias |
+| `GetMappedPort(int containerPort)` | Host-side port for an exposed container port |
+| `GetLogsAsync()` | Combined stdout + stderr as a string |
