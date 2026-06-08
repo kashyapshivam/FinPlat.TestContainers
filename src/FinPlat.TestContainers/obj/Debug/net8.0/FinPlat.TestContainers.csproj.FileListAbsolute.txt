@@ -1,0 +1,13 @@
+C:\Users\shivkashyap\repos\FinPlat.TestContainers\src\FinPlat.TestContainers\obj\Debug\net8.0\FinPlat.TestContainers.csproj.AssemblyReference.cache
+C:\Users\shivkashyap\repos\FinPlat.TestContainers\src\FinPlat.TestContainers\obj\Debug\net8.0\FinPlat.TestContainers.GeneratedMSBuildEditorConfig.editorconfig
+C:\Users\shivkashyap\repos\FinPlat.TestContainers\src\FinPlat.TestContainers\obj\Debug\net8.0\FinPlat.TestContainers.AssemblyInfoInputs.cache
+C:\Users\shivkashyap\repos\FinPlat.TestContainers\src\FinPlat.TestContainers\obj\Debug\net8.0\FinPlat.TestContainers.AssemblyInfo.cs
+C:\Users\shivkashyap\repos\FinPlat.TestContainers\src\FinPlat.TestContainers\obj\Debug\net8.0\FinPlat.TestContainers.csproj.CoreCompileInputs.cache
+C:\Users\shivkashyap\repos\FinPlat.TestContainers\src\FinPlat.TestContainers\bin\Debug\net8.0\FinPlat.TestContainers.deps.json
+C:\Users\shivkashyap\repos\FinPlat.TestContainers\src\FinPlat.TestContainers\bin\Debug\net8.0\FinPlat.TestContainers.dll
+C:\Users\shivkashyap\repos\FinPlat.TestContainers\src\FinPlat.TestContainers\bin\Debug\net8.0\FinPlat.TestContainers.pdb
+C:\Users\shivkashyap\repos\FinPlat.TestContainers\src\FinPlat.TestContainers\obj\Debug\net8.0\FinPlat.TestContainers.dll
+C:\Users\shivkashyap\repos\FinPlat.TestContainers\src\FinPlat.TestContainers\obj\Debug\net8.0\refint\FinPlat.TestContainers.dll
+C:\Users\shivkashyap\repos\FinPlat.TestContainers\src\FinPlat.TestContainers\obj\Debug\net8.0\FinPlat.TestContainers.pdb
+C:\Users\shivkashyap\repos\FinPlat.TestContainers\src\FinPlat.TestContainers\obj\Debug\net8.0\ref\FinPlat.TestContainers.dll
+C:\Users\shivkashyap\repos\FinPlat.TestContainers\src\FinPlat.TestContainers\obj\Debug\net8.0\FinPlat.TestContainers.sourcelink.json
