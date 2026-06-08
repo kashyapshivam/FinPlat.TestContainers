@@ -260,6 +260,11 @@ The builder automatically:
 2. Waits for health checks before starting dependent apps
 3. Injects inter-container URLs as environment variables
 
+> **Doing more than two services that share Azurite and call each other over
+> HTTP?** Read [MULTISERVICE.md](MULTISERVICE.md) for the patterns, seed
+> recipes, auth shortcuts and pitfalls collected from shipping the
+> FO + Collector.FD + Collector.Orchestrator three-app SLT.
+
 ## CLI Tool (`dotnet-slt`)
 
 Zero-config scaffolding for new SLT projects:
