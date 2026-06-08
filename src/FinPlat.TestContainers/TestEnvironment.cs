@@ -7,6 +7,7 @@ using Azure.Data.Tables;
 using Azure.Storage.Blobs;
 using Azure.Storage.Blobs.Models;
 using Azure.Storage.Queues;
+using FinPlat.TestContainers.Builder;
 using FinPlat.TestContainers.Config;
 using FinPlat.TestContainers.Containers;
 using FinPlat.TestContainers.Fluent;
@@ -25,23 +26,29 @@ public class TestEnvironment : IAsyncDisposable
     private readonly ManagedAzuriteContainer? _azurite;
     private readonly Dictionary<string, ManagedWireMockContainer> _wireMockContainers;
     private readonly Dictionary<string, ManagedAppContainer> _appContainers;
+    private readonly Dictionary<string, int> _appHttpPorts;
     private readonly CertificateMaterial? _cert;
     private readonly ManagedTlsProxyContainer? _tlsProxy;
+    private readonly Dictionary<string, ContainerDebugInfo> _debugInfos;
 
     internal TestEnvironment(
         INetwork network,
         ManagedAzuriteContainer? azurite,
         Dictionary<string, ManagedWireMockContainer> wireMockContainers,
         Dictionary<string, ManagedAppContainer> appContainers,
+        Dictionary<string, int> appHttpPorts,
         CertificateMaterial? cert = null,
-        ManagedTlsProxyContainer? tlsProxy = null)
+        ManagedTlsProxyContainer? tlsProxy = null,
+        Dictionary<string, ContainerDebugInfo>? debugInfos = null)
     {
         _network = network;
         _azurite = azurite;
         _wireMockContainers = wireMockContainers;
         _appContainers = appContainers;
+        _appHttpPorts = appHttpPorts;
         _cert = cert;
         _tlsProxy = tlsProxy;
+        _debugInfos = debugInfos ?? new Dictionary<string, ContainerDebugInfo>();
     }
 
     /// <summary>
@@ -118,6 +125,28 @@ public class TestEnvironment : IAsyncDisposable
     }
 
     /// <summary>
+    /// Executes one or more seed steps (table rows, blobs, HTTP POSTs) against the
+    /// running environment. Use this for per-test seeding when build-time seeding
+    /// isn't appropriate (e.g. fixtures depend on the test name).
+    /// </summary>
+    /// <param name="configure">Action that registers seed steps via <see cref="Builder.SeedBuilder"/>.</param>
+    public async Task SeedAsync(Action<Builder.SeedBuilder> configure)
+    {
+        if (configure is null) throw new ArgumentNullException(nameof(configure));
+        var builder = new Builder.SeedBuilder();
+        configure(builder);
+        if (builder.Config.Steps.Count == 0) return;
+
+        await Builder.SeedExecutor.ExecuteAsync(
+            builder.Config,
+            _azurite,
+            _appContainers,
+            _appHttpPorts,
+            bypassSsl: _azurite?.IsTokenAuthMode ?? false,
+            Console.Out);
+    }
+
+    /// <summary>
     /// Gets container logs for the specified application. Useful for debugging failures.
     /// </summary>
     /// <param name="appName">Name of the application.</param>
@@ -127,6 +156,74 @@ public class TestEnvironment : IAsyncDisposable
             throw new InvalidOperationException($"Application '{appName}' was not registered.");
 
         return await container.GetLogsAsync();
+    }
+
+    /// <summary>
+    /// Returns the in-container debug attach details for an application that was registered
+    /// with <see cref="Builder.TestEnvironmentBuilder.AttachableInDebugger"/>.
+    /// Returns <c>null</c> if the application is not configured for in-container debugging.
+    /// </summary>
+    /// <param name="appName">Name of the application.</param>
+    public ContainerDebugInfo? GetContainerDebugInfo(string appName)
+    {
+        if (string.IsNullOrWhiteSpace(appName))
+            throw new ArgumentException("App name is required.", nameof(appName));
+
+        return _debugInfos.TryGetValue(appName, out var info) ? info : null;
+    }
+
+    /// <summary>
+    /// Blocks the calling thread until a <c>vsdbg</c> process appears inside the named
+    /// application's container, indicating that an external debugger (VS Code / Visual Studio)
+    /// has successfully attached. Useful at the start of a test to pause execution while
+    /// the user lines up their breakpoints.
+    /// </summary>
+    /// <param name="appName">Name of the application registered via AttachableInDebugger.</param>
+    /// <param name="timeout">Maximum time to wait. Defaults to 5 minutes.</param>
+    /// <exception cref="TimeoutException">If no vsdbg process is observed within the timeout.</exception>
+    public async Task WaitForDebuggerAsync(string appName, TimeSpan? timeout = null)
+    {
+        var info = GetContainerDebugInfo(appName)
+            ?? throw new InvalidOperationException(
+                $"Application '{appName}' is not registered for in-container debugging. " +
+                "Call AttachableInDebugger(\"" + appName + "\") on the builder before BuildAsync.");
+
+        var deadline = DateTimeOffset.UtcNow + (timeout ?? TimeSpan.FromMinutes(5));
+        Console.WriteLine($"[FinPlat.TestContainers] Waiting for debugger to attach to '{appName}' (container: {info.ContainerName})...");
+
+        while (DateTimeOffset.UtcNow < deadline)
+        {
+            if (await IsVsDbgRunningAsync(info.ContainerName))
+            {
+                Console.WriteLine($"[FinPlat.TestContainers] Debugger attached to '{appName}'. Continuing test execution.");
+                return;
+            }
+
+            await Task.Delay(TimeSpan.FromSeconds(2));
+        }
+
+        throw new TimeoutException(
+            $"Timed out waiting for a debugger to attach to '{appName}' (container: {info.ContainerName}). " +
+            "Open the launch.json snippet printed during BuildAsync in VS Code and press F5 to attach.");
+    }
+
+    private static async Task<bool> IsVsDbgRunningAsync(string containerName)
+    {
+        var psi = new System.Diagnostics.ProcessStartInfo
+        {
+            FileName = "docker",
+            Arguments = $"exec {containerName} sh -c \"pgrep -f vsdbg >/dev/null && echo yes || echo no\"",
+            RedirectStandardOutput = true,
+            RedirectStandardError = true,
+            UseShellExecute = false,
+            CreateNoWindow = true,
+        };
+
+        using var proc = System.Diagnostics.Process.Start(psi);
+        if (proc is null) return false;
+        var stdout = (await proc.StandardOutput.ReadToEndAsync()).Trim();
+        await proc.WaitForExitAsync();
+        return proc.ExitCode == 0 && stdout == "yes";
     }
 
     /// <summary>
@@ -384,11 +481,19 @@ public class QueueAccessor
 
     /// <summary>
     /// Gets the approximate number of messages in the queue.
+    /// Returns 0 if the queue does not exist.
     /// </summary>
     public async Task<int> GetMessageCountAsync()
     {
-        var properties = await _client.GetPropertiesAsync();
-        return properties.Value.ApproximateMessagesCount;
+        try
+        {
+            var properties = await _client.GetPropertiesAsync();
+            return properties.Value.ApproximateMessagesCount;
+        }
+        catch (Azure.RequestFailedException ex) when (ex.Status == 404)
+        {
+            return 0;
+        }
     }
 
     /// <summary>
@@ -972,6 +1077,13 @@ public class StorageAccessor
         _connectionString = connectionString;
         _bypassSsl = bypassSsl;
     }
+
+    /// <summary>
+    /// Gets the raw Azurite connection string (host-side, with mapped ports).
+    /// Useful for plugging into Azure Storage Explorer or external CLI tools
+    /// during a manual walkthrough/debug session.
+    /// </summary>
+    public string ConnectionString => _connectionString;
 
     /// <summary>
     /// Gets a <see cref="BlobAccessor"/> for the specified container.

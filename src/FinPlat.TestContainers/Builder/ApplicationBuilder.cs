@@ -1,5 +1,6 @@
 using System;
 using System.Collections.Generic;
+using FinPlat.TestContainers.Config;
 
 namespace FinPlat.TestContainers.Builder;
 
@@ -18,6 +19,7 @@ public class ApplicationBuilder
     internal string? HealthCheckPath { get; private set; }
     internal int? HealthCheckPort { get; private set; }
     internal int HealthCheckTimeoutSeconds { get; private set; } = 60;
+    internal DebuggerSupportOptions? DebuggerSupport { get; private set; }
 
     /// <summary>
     /// Builds the application container from a Dockerfile.
@@ -89,6 +91,27 @@ public class ApplicationBuilder
         HealthCheckPath = path;
         HealthCheckPort = port;
         HealthCheckTimeoutSeconds = timeoutSeconds;
+        return this;
+    }
+
+    /// <summary>
+    /// Enables in-container debugger support: the library wraps the application image
+    /// with an extra layer that installs <c>vsdbg</c> (Microsoft's CLI .NET debugger)
+    /// into <c>/vsdbg/vsdbg</c>, and the resulting container is run with
+    /// <c>SYS_PTRACE</c> capability so a developer can attach VS Code / Visual Studio
+    /// from the host via <c>docker exec</c>.
+    /// </summary>
+    /// <remarks>
+    /// Pair this with <see cref="TestEnvironmentBuilder.AttachableInDebugger"/> to also
+    /// pin a deterministic container name so a saved <c>launch.json</c> entry keeps
+    /// working across runs. The application image must be Debian/Ubuntu or Alpine based;
+    /// distroless / scratch images are not supported. Linux containers only.
+    /// </remarks>
+    /// <param name="configure">Optional configuration of vsdbg version, base image family, and source map.</param>
+    public ApplicationBuilder WithDebuggerSupport(Action<DebuggerSupportOptions>? configure = null)
+    {
+        DebuggerSupport = new DebuggerSupportOptions();
+        configure?.Invoke(DebuggerSupport);
         return this;
     }
 }

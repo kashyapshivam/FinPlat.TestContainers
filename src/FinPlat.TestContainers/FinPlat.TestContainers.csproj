@@ -16,4 +16,8 @@
     <PackageReference Include="WireMock.Net" Version="2.6.0" />
   </ItemGroup>
 
+  <ItemGroup>
+    <InternalsVisibleTo Include="FinPlat.TestContainers.Tests" />
+  </ItemGroup>
+
 </Project>

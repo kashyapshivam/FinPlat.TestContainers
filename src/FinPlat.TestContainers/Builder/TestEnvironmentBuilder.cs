@@ -21,6 +21,7 @@ public class TestEnvironmentBuilder
     private readonly Dictionary<string, ApplicationBuilder> _applications = new();
     private readonly Dictionary<string, MockApiBuilder> _mockApis = new();
     private readonly Dictionary<string, WiringBuilder> _wirings = new();
+    private readonly Dictionary<string, InContainerDebugOptions> _inContainerDebugApps = new();
     private string? _instanceId;
 
     /// <summary>
@@ -103,6 +104,36 @@ public class TestEnvironmentBuilder
     }
 
     /// <summary>
+    /// Marks an application container so it can be hooked up to an external debugger
+    /// (VS Code / Visual Studio) via <c>vsdbg</c> already layered into the image.
+    /// The application must have been declared with <see cref="ApplicationBuilder.WithDebuggerSupport"/>
+    /// or this call will throw at <see cref="BuildAsync"/> time.
+    /// </summary>
+    /// <param name="appName">Name of the application (must match a name passed to AddApplication).</param>
+    /// <param name="configure">Optional callback to customise the attach behaviour.</param>
+    /// <remarks>
+    /// When set, the container is started with a deterministic name, additional ptrace
+    /// capabilities, and labels so the library can locate and clean it up. After
+    /// <see cref="BuildAsync"/> returns, call
+    /// <see cref="TestEnvironment.GetContainerDebugInfo"/> to retrieve the attach details
+    /// and printed launch.json snippet.
+    /// </remarks>
+    public TestEnvironmentBuilder AttachableInDebugger(
+        string appName,
+        Action<InContainerDebugOptions>? configure = null)
+    {
+        if (string.IsNullOrWhiteSpace(appName))
+        {
+            throw new ArgumentException("App name is required.", nameof(appName));
+        }
+
+        var opts = new InContainerDebugOptions();
+        configure?.Invoke(opts);
+        _inContainerDebugApps[appName] = opts;
+        return this;
+    }
+
+    /// <summary>
     /// Builds and starts all configured containers in the correct order:
     /// 1. Creates a shared Docker network.
     /// 2. Starts Azurite (if added) and pre-creates resources.
@@ -128,6 +159,8 @@ public class TestEnvironmentBuilder
         ManagedTlsProxyContainer? tlsProxy = null;
         var wireMockContainers = new Dictionary<string, ManagedWireMockContainer>();
         var appContainers = new Dictionary<string, ManagedAppContainer>();
+        var appHttpPorts = new Dictionary<string, int>();
+        var debugInfos = new Dictionary<string, ContainerDebugInfo>();
 
         try
         {
@@ -284,11 +317,27 @@ public class TestEnvironmentBuilder
                     appBuilder.DockerfilePath,
                     appBuilder.ContextPath,
                     appBuilder.ImageName,
-                    appBuilder.ExposedPorts);
+                    appBuilder.ExposedPorts,
+                    appBuilder.DebuggerSupport,
+                    _inContainerDebugApps.TryGetValue(appName, out var dbgOpts) ? dbgOpts : null,
+                    InstanceId);
 
                 // Mount cert into app container for TLS trust (if token auth)
                 await appContainer.StartAsync(network, envVars, cert);
                 appContainers[appName] = appContainer;
+
+                // Record HTTP port for seed step execution.
+                int httpPort = appBuilder.InternalServicePort ?? appBuilder.ExposedPorts.FirstOrDefault();
+                if (httpPort > 0)
+                {
+                    appHttpPorts[appName] = httpPort;
+                }
+
+                // Capture debug-attach info for AttachableInDebugger apps.
+                if (dbgOpts is not null && appContainer.DebugInfo is not null)
+                {
+                    debugInfos[appName] = appContainer.DebugInfo;
+                }
 
                 // Wait for health check if configured
                 if (appBuilder.HealthCheckPath is not null)
@@ -304,7 +353,31 @@ public class TestEnvironmentBuilder
                 }
             }
 
-            return new TestEnvironment(network, azurite, wireMockContainers, appContainers, cert, tlsProxy);
+            // Validate that every AttachableInDebugger app was actually registered + supported.
+            foreach (var attachableApp in _inContainerDebugApps.Keys)
+            {
+                if (!_applications.TryGetValue(attachableApp, out var appBuilder))
+                {
+                    throw new InvalidOperationException(
+                        $"AttachableInDebugger('{attachableApp}') was called but no application with that name was registered via AddApplication.");
+                }
+
+                if (appBuilder.DebuggerSupport is null)
+                {
+                    throw new InvalidOperationException(
+                        $"AttachableInDebugger('{attachableApp}') requires that the application be declared with .WithDebuggerSupport() so vsdbg can be installed into the image.");
+                }
+            }
+
+            return new TestEnvironment(
+                network,
+                azurite,
+                wireMockContainers,
+                appContainers,
+                appHttpPorts,
+                cert,
+                tlsProxy,
+                debugInfos);
         }
         catch
         {
