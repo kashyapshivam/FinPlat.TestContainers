@@ -457,7 +457,144 @@ reads from.
 
 **Fix:** Check the receiving service's config for which env var binds to
 `CollectorUri` (look in `IConfiguration` reads or `appsettings.json`).
-Use the **exact** name in `.AppUrl(<alias>, <envVarName>)`.
+Use the **exact** name in `.AppUrl(<alias>, <envVarName>)`. **See also
+Pitfall 9 below** — for some apps the JSON config wins over the env var and
+you must edit the JSON directly.
+
+### Pitfall 8 — Static `azurite.crt` baked into the image missing `*.dfs.<suffix>` SAN
+
+**Symptom:** fo-worker's calls into the MDC output processor / DataLake
+storage fail with
+`AuthenticationException: The remote certificate is invalid because of
+errors in the certificate chain: RemoteCertificateNameMismatch`. The
+strict demo test never gets to write a journal blob — assertion fails with
+`'bigcatproduct-v3' should contain >= 1 journal blob. Found: 0`.
+
+**Why:** `AdlsFileStoreAdapter.GetAccountUri()` constructs the DataLake
+client URI as `https://{account}.blob.{suffix}`. The Azure DataLake SDK
+then internally swaps `.blob.` → `.dfs.` for DFS REST operations. The
+nginx TLS proxy reverse-proxies BOTH `*.blob.azurite.local` AND
+`*.dfs.azurite.local` to Azurite. **The cert must cover both.**
+
+Two cert generators exist and **must stay in sync**:
+- `FinPlat.TestContainers/Builder/CertificateGenerator.cs` (dynamic, has
+  `.dfs.` support — used when no `ExternalCertificate` is passed)
+- `.slt/docker/nginx/generate-cert.ps1` (static, baked into the docker
+  image as `azurite.crt` — used when `ExternalCertificate = cert` is
+  passed). **This was missing `.dfs.` SANs and must be regenerated.**
+
+**How to detect:** Exec into a running container and dump the cert SANs:
+
+```powershell
+docker exec <container-id> openssl x509 -in /etc/pki/ca-trust/source/anchors/azurite.crt -noout -ext subjectAltName
+```
+
+If the output does NOT include `DNS:*.dfs.<suffix>` and
+`DNS:devstoreaccount1.dfs.<suffix>` you're hit by this pitfall.
+
+**Fix:**
+1. Edit `.slt/docker/nginx/generate-cert.ps1` so the `[alt_names]` block
+   contains entries for `.dfs.` as well as `.blob./.queue./.table.`:
+   ```ini
+   DNS.5 = devstoreaccount1.dfs.azurite.local
+   DNS.9 = *.dfs.azurite.local
+   ```
+2. Delete the stale `.slt/docker/nginx/azurite.crt` and `azurite.key`.
+3. Re-run `generate-cert.ps1` to regenerate them.
+4. **Force-rebuild the SLT images** (testcontainers may have a cached
+   image with the old cert baked in):
+   ```powershell
+   docker rmi -f $(docker images --format "{{.ID}}" "finplat-test-*")
+   docker rmi -f fo-worker-slt:latest collector-fd-slt:latest collector-orch-slt:latest
+   ```
+5. Re-run the test cold. SSL errors in
+   `%TEMP%\slt-fo-worker.log` should drop to zero.
+
+### Pitfall 9 — Env-var override doesn't always beat JSON config for downstream URIs
+
+**Symptom:** You wire `.AppUrl("collector-fd", "CollectorUri")` on the
+fo-worker container, but logs show fo-worker still POSTing to
+`http://mock-services:8080/v1.0/ingestion` (i.e. WireMock), receiving back
+`[]` (JSON array), and dying with
+`JsonDeserializationException: expected JSON object but got JSON array`
+when deserializing into `IngestionResponseContractV1`.
+
+**Why:** The fo-worker host class
+(`FinancialOrchestratorHost : AzureBlobOrchestratorHost<…>`) loads its
+config from JSON file paths only — `AddEnvironmentVariables()` is not
+in the config chain for these keys, or the JSON value wins. The
+`.AppUrl(...)` wiring injects an env var (`CollectorUri=…`) that the
+host never reads.
+
+**Fix:** Edit `.slt/docker/config.docker.json` directly. Find the
+`CollectorUri` (or whichever app-to-app URI is wrong) and change it to
+the in-network DNS name of the receiver container:
+
+```jsonc
+"CollectorUri": "http://collector-fd:8080/",
+```
+
+Keep `.AppUrl(...)` wiring too — it's defensive and works for apps that
+DO honor env vars. Verify the fix by grepping the fo-worker log:
+
+```powershell
+Select-String -Path "$env:TEMP\slt-fo-worker.log" `
+    -Pattern "POST http://(collector-fd|mock-services):8080/v1.0/ingestion"
+```
+
+All `POST … /v1.0/ingestion` lines should be to `collector-fd`, not
+`mock-services`.
+
+### Pitfall 10 — WireMock-issued `FakeAccessToken` lacks `appid`/`oid` → real Collector returns 401
+
+**Symptom:** Logs show fo-worker now correctly POSTs to
+`http://collector-fd:8080/v1.0/ingestion` (per Pitfall 9 fix), but **every
+call returns HTTP 401 Unauthorized**. Stack trace:
+`DownstreamServiceException: Unauthorized` in
+`CFS.FinancialOrchestrator.Worker.Helper.IAsyncIngest`.
+
+**Why:** The framework's `AuthStubs.cs` stubs out
+`https://login.microsoftonline.com/.../oauth2/v2.0/token` and returns a
+hand-crafted JWT (the `FakeAccessToken` constant). With
+`EnableS2SAuthentication=false` set on Collector.FD in
+`.slt/docker/fd-config/Configuration/config.docker.json`,
+`Microsoft.Crs.Financials.AspNetCore`'s `GetClientDetails()` **parses
+(does not validate)** the bearer JWT and reads the `appid`/`oid` claims
+directly. If those claims are missing, no partner is resolved and
+authorization fails with 401.
+
+**How to detect:** Decode the token fo-worker is sending. The
+`Authorization: Bearer …` value is in the log. Pipe its payload (the
+middle segment) to base64-decode — if it lacks `"appid"` and `"oid"`,
+you're hit by this.
+
+**Fix:** Update `FinPlat.TestContainers/Config/AuthStubs.cs` so
+`FakeAccessToken` carries the partner claims the receiving Collector
+expects:
+
+```jsonc
+// JWT payload (middle segment of the .NET-generated 3-part token)
+{
+  "aud":   "https://storage.azure.com",
+  "iss":   "https://sts.windows.net/00000000-…/",
+  "sub":   "test-subject",
+  "appid": "33349fe2-44d3-47b3-b8c7-9bf8279cdf6b",  // matches PartnerConfiguration.ApplicationId
+  "oid":   "d8a24b41-d537-47bb-95c6-f5aa46ead300",
+  "name":  "FinancialOrchestrator",
+  "iat": 1700000000, "nbf": 1700000000, "exp": 9999999999
+}
+```
+
+`appid` must match a `PartnerConfiguration.Partners[*].ApplicationId`
+entry in the Collector.FD config (look in
+`.slt/docker/fd-config/Configuration/config.docker.json`). The signature
+is not validated, so an unsigned-or-fake-signed JWT is fine. **No docker
+image rebuild needed** — `FinPlat.TestContainers` is a project ref into
+the test process, not into the container image; the WireMock stub it
+registers runs in the WireMock container which restarts each test.
+
+After this fix: `Select-String -Path "$env:TEMP\slt-fo-worker.log"
+-Pattern "401|Unauthorized"` should be empty for the fo-worker calls.
 
 ---
 
@@ -489,6 +626,15 @@ silently fail on bad fixture shape.
       caller is really calling the receiver — not a coincidence)
 - [ ] Removing one preseed step makes the relevant test method fail with a
       meaningful assertion (proves the preseed matters)
+- [ ] You're running the **strict** test (asserts on the *specific* target
+      container, e.g. `bigcatproduct-v3`) and not just the loose
+      marquee test (asserts `totalBlobs > 0` across *all* containers).
+      The loose one passes from seed-side blobs alone and is misleading
+      for "end-to-end works" claims. See Pitfall 6.
+- [ ] `Select-String -Path "$env:TEMP\slt-*.log" -Pattern
+      "RemoteCertificateNameMismatch|401|Unauthorized|expected JSON object but got JSON array"`
+      returns zero matches in the steady-state run (transient hits during
+      container warmup are ok).
 
 If any of those bullets are weak, the test will pass on lucky days and fail
 on unlucky ones. Keep iterating until all five hold.

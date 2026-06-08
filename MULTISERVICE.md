@@ -271,6 +271,61 @@ This is your debugger when a seed times out. Don't try to write your own —
 it's already there. The full per-app log files are the high-signal artifact;
 the inline tail is just a hint to push you toward them.
 
+### 7. The static `azurite.crt` must cover `*.dfs.<suffix>`, not just `*.blob.`
+
+If your test exercises the DataLake/MDC output path on top of Azurite, the
+runtime `https://{account}.blob.{suffix}` URI built by
+`AdlsFileStoreAdapter.GetAccountUri()` gets rewritten to `…dfs.{suffix}` by
+the Azure SDK for DFS REST calls. Your cert must cover **both** SANs.
+
+If your repo passes `ExternalCertificate = <baked-in cert>` (as
+`slt_testing` does), the dynamic generator (`CertificateGenerator.cs`,
+which has `.dfs.` support) is bypassed and the static file
+(`.slt/docker/nginx/azurite.crt`) wins. If that file was generated before
+DFS support was added, you'll see
+`AuthenticationException: RemoteCertificateNameMismatch` on the first
+DataLake call.
+
+Fix: edit `.slt/docker/nginx/generate-cert.ps1` so `[alt_names]` includes
+`DNS:devstoreaccount1.dfs.<suffix>` and `DNS:*.dfs.<suffix>`, regenerate
+the `azurite.crt`/`azurite.key`, then **delete any cached SLT images**
+(`finplat-test-*` and `*-slt:latest`) so the new cert is baked in on
+rebuild.
+
+### 8. `.AppUrl(<peer>, <env>)` doesn't always beat the JSON config
+
+`.AppUrl("collector-fd", "CollectorUri")` injects an env var, but some
+host classes (e.g. `FinancialOrchestratorHost`) only load from JSON
+config files and never call `AddEnvironmentVariables()` for these keys.
+The JSON value silently wins. Symptom: caller still hits the WireMock
+mock-services URL even though `.AppUrl(...)` is present, and you get
+`JsonDeserializationException` deserializing WireMock's empty `[]`
+response into the real DTO.
+
+Fix: edit `.slt/docker/config.docker.json` (or equivalent) **directly**
+to point the URI at the in-network DNS name of the peer container
+(e.g. `"CollectorUri": "http://collector-fd:8080/"`). Keep
+`.AppUrl(...)` too — it's defensive and works for apps that do read env
+vars.
+
+### 9. `FakeAccessToken` must carry `appid`/`oid`, not just the seed JWT
+
+Section 4 above shows minting the bearer token for **preseed POSTs from
+the test process**. That's not the only token in flight: at runtime the
+fo-worker calls MSAL → `https://login.microsoftonline.com/.../oauth2/v2.0/token`,
+which is stubbed by `AuthStubs.cs` returning the framework's
+`FakeAccessToken` constant. **That token also needs the partner claims**
+or the receiving Collector returns 401.
+
+The framework ships a default `FakeAccessToken` carrying
+`appid = 33349fe2-44d3-47b3-b8c7-9bf8279cdf6b` (FinancialOrchestrator).
+If your Collector partner config uses a different `ApplicationId`,
+override the token endpoint via `AddMockApi("services", …)` and return
+a JWT with the matching claims.
+
+Verify in `%TEMP%\slt-<caller>.log` — the steady-state run should show
+zero `401`/`Unauthorized` lines from the caller-to-receiver path.
+
 ## Quick recipe: adding a third service
 
 1. **`AddApplication("svc-c", ...)`** — point at its dockerfile, set env

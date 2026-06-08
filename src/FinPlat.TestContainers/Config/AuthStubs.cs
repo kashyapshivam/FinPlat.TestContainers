@@ -9,8 +9,15 @@ namespace FinPlat.TestContainers.Config;
 /// </summary>
 public static class AuthStubs
 {
+    // Static JWT with partner claims (appid/oid/name) required by Collector.FD's
+    // GetClientDetails() when EnableS2SAuthentication=false. Signature is not validated.
+    // Default partner identity: FinancialOrchestrator (appid 33349fe2-…) — the standard
+    // FO partner registered in the SLT Collector.FD config. Tests that need a different
+    // partner can override the token endpoint stub via AddMockApi("services", …).
+    // Decoded payload:
+    //   { aud, iss, sub, appid, oid, name, iat, nbf, exp:9999999999 }
     private const string FakeAccessToken =
-        "eyJhbGciOiJSUzI1NiIsInR5cCI6IkpXVCJ9.eyJhdWQiOiJodHRwczovL3N0b3JhZ2UuYXp1cmUuY29tIiwiaXNzIjoiaHR0cHM6Ly9zdHMud2luZG93cy5uZXQvMDAwMDAwMDAtMDAwMC0wMDAwLTAwMDAtMDAwMDAwMDAwMDAwLyIsImlhdCI6MTcwMDAwMDAwMCwibmJmIjoxNzAwMDAwMDAwLCJleHAiOjk5OTk5OTk5OTksInN1YiI6InRlc3Qtc3ViamVjdCJ9.fake-signature";
+        "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJhdWQiOiJodHRwczovL3N0b3JhZ2UuYXp1cmUuY29tIiwiaXNzIjoiaHR0cHM6Ly9zdHMud2luZG93cy5uZXQvMDAwMDAwMDAtMDAwMC0wMDAwLTAwMDAtMDAwMDAwMDAwMDAwLyIsInN1YiI6InRlc3Qtc3ViamVjdCIsIm9pZCI6ImQ4YTI0YjQxLWQ1MzctNDdiYi05NWM2LWY1YWE0NmVhZDMwMCIsIm5hbWUiOiJGaW5hbmNpYWxPcmNoZXN0cmF0b3IiLCJleHAiOjk5OTk5OTk5OTksImFwcGlkIjoiMzMzNDlmZTItNDRkMy00N2IzLWI4YzctOWJmODI3OWNkZjZiIiwibmJmIjoxNzAwMDAwMDAwLCJpYXQiOjE3MDAwMDAwMDB9.fake-signature";
 
     /// <summary>
     /// Creates a stub for the OAuth2 token endpoint (POST /{tenant}/oauth2/v2.0/token).
